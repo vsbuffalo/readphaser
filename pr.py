@@ -5,7 +5,7 @@ hapcut.HapCut() takes a hapcut file and returns a dictionary of
 refnames and a list of hapcut.Blocks. Each hapcut.Block contains
 block info and a list of block entries (phased variants).
 """
-
+TEST = True
 import pdb
 import sys
 import argparse
@@ -14,6 +14,36 @@ import pysam
 from Bio.Seq import Seq
 from hapcut import HapCut
 import fermi as fm
+
+class ReadSet(object):
+    def __init__(self, refname, block, haplotype):
+        self.refname = refname
+        self.block = block
+        self.haplotype = haplotype
+        self.readset = dict()
+    def add_read(self, read):
+        """
+        Add a read, modifying header to include the contig and phasing
+        info. Also, look at mapping orientation and reverse if necessary.
+        """
+        if read.qname not in self.readset:
+            self.readset[read.qname] = [None, None]
+        which_read = 0 if read.is_read1 else 1
+        seq = read.seq
+        if read.is_reverse:
+            seq = revcomp(seq)
+        if TEST and None not in self.readset[read.qname]:
+            assert(self.readset[read.qname][which_read] == seq)
+        self.readset[read.qname][which_read] = seq
+    def write_reads(self, file_handle):
+        for qname, seqs in self.readset.iteritems():
+            for i, seq in enumerate(seqs):
+                if seq is None:
+                    continue
+                which = i + 1
+                fields = map(str, (qname, which, self.refname, self.block, self.haplotype))
+                header = "%s-%s %s_%s_%s" % tuple(fields)
+                file_handle.write(">%s\n%s\n" % (header, seq))
 
 def revcomp(seq):
     return str(Seq(seq).reverse_complement())
@@ -47,8 +77,7 @@ def getmate_factory(refname, bamfile):
 
     return getter
 
-
-def group_reads_by_block(block, bamfile, getmate):
+def group_reads_by_block(block, block_id, bamfile, getmate, callback=None):
     """
     Take a HapCut hapcut.Block (a single phased block) and a BAM file
     and group the BAM file's reads.
@@ -56,6 +85,7 @@ def group_reads_by_block(block, bamfile, getmate):
     Intervals are 0-indexed. HapCut is 1-indexed (thus,
     entry.position-1). 
     """
+    refname = block.entries[0].chromosome
     # make a dictionary of all variants in a phased block
     haplotypes = dict()
     for entry in block.entries:
@@ -64,10 +94,10 @@ def group_reads_by_block(block, bamfile, getmate):
         allele_len = len(entry.ref_allele)
         haplotypes[(entry.position-1, entry.position-1 + allele_len, allele_len)] = dict([ref_key, var_key])
 
-    readsets = {0:list(), 1:list()} # TODO make set
-    unused_phased = list()
+    readsets = {0:ReadSet(refname, block_id, 0), 1:ReadSet(refname, block_id, 1)}
+    unused_phased = ReadSet(refname, "NA", "NA")
     stats = Counter()
-    for read in bamfile.fetch(entry.chromosome):
+    for read in bamfile.fetch(refname):
         if read.is_unmapped:
             continue
         for key, alleles in haplotypes.items():
@@ -79,51 +109,66 @@ def group_reads_by_block(block, bamfile, getmate):
                 # check for indel, which will break our variant
                 # retrieval.
                 if has_indel(read):
+                    # TODO: we are losing reads here... possibly many
+                    unused_phased.add_read(read)
                     stats['indel_ignore'] += 1
                 else:
                     read_var = read.query[interval[0]-read.pos:interval[1]-read.pos]
                     htype = alleles.get(read_var, None)
                     if htype is not None:
                         stats['phased'] += 1
-                        readsets[htype].append(read)
+                        readsets[htype].add_read(read)
                         read_mate = getmate(read)
                         if read_mate is not None:
-                            readsets[htype].append(read_mate)
+                            readsets[htype].add_read(read_mate)
                             stats['phased_mates'] += 1
                     else:
                         # read does not have a phased variant
-                        unused_phased.append(read)
+                        unused_phased.add_read(read)
                         stats['unused'] += 1
-                        pdb.set_trace()
-
-    fermi = fm.Fermi()
-    for read in readsets[0]:
-        fermi.addseq(read.query)
-    fermi.correct()
-    tigs = fermi.assemble(do_clean=True)
-    pdb.set_trace()
-
+                        #pdb.set_trace()
     # TODO how to handle mates for phased and unphased
-    
+    if callback is not None:
+        callback(readsets, unused_phased)
 
-def phase_reads(bam_filename, hapcut_filename, region=None):
+def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_filename, region=None):
     sys.stderr.write("[phase_reads] opening alignment BAM file...\t")
     bamfile = pysam.Samfile(bam_filename, 'rb')
     sys.stderr.write("done.\n")
+
+    if phased_filename is not None:
+        sys.stderr.write("[phase_reads] opening FASTA file for phased reads...\t")
+        phasedfile = open(phased_filename, 'w')
+        sys.stderr.write("done.\n")
+
+    if unused_phased_filename is not None:
+        sys.stderr.write("[phase_reads] opening FASTA file for unused phased reads...\t")
+        unused_phasedfile = open(unused_phased_filename, 'w')
+        sys.stderr.write("done.\n")
 
     hapcut_dict = HapCut(open(hapcut_filename, 'r')).to_dict()
 
     if region is not None:
         hapcut_dict = dict([(region, hapcut_dict[region])])
 
+    def writer_callback(phased_readset, unused_readset):
+        if phased_filename is not None:
+            phased_readset[0].write_reads(phasedfile)
+            phased_readset[1].write_reads(phasedfile)
+        if unused_phased_filename is not None:
+            unused_readset.write_reads(unused_phasedfile)
+
+    def assembly_callback(phased_readset, unused_readset):
+        fermi = fm.Fermi()
+        for read in readsets[0]:
+            fermi.addseq(read.query)
+            fermi.correct()
+            tigs = fermi.assemble(do_clean=True)
+
     for refname, phased_blocks in hapcut_dict.iteritems():
         getmate = getmate_factory(refname, bamfile)
-        for i, block in enumerate(phased_blocks):
-            group_reads_by_block(block, bamfile, getmate)
-    
-    pdb.set_trace()
-    
-
+        for block_id, block in enumerate(phased_blocks):
+            group_reads_by_block(block, block_id, bamfile, getmate, writer_callback)
 
 if __name__ == "__main__":
     msg = "divide reads into groups, based on HapCut phasing results"
@@ -147,4 +192,4 @@ if __name__ == "__main__":
                         type=str, nargs="?")
 
     args = parser.parse_args()
-    phase_reads(args.bam, args.hapcut, region=args.region)
+    phase_reads(args.bam, args.hapcut, args.phased, args.unused_phased, region=args.region)
