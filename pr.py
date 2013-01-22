@@ -82,14 +82,14 @@ def print_block_stats(refname, block_id, allele_counts, read_stats):
     """
     For each block, print allele counts and the read statistics.
     """
-    tmp = (refname, block_id, read_stats['num_phased'], read_stats['indel_ignore'], read_stats['unused'])
+    tmp = (refname, block_id, read_stats['phased'], read_stats['indel_ignore'], read_stats['unused'])
     sys.stderr.write("# contig='%s' block_id=%d num_phased=%d indel_ignore=%d unused=%d\n" % tmp)
     sorted_counts = sorted(allele_counts.items(), key=itemgetter(0))
     for pos, counts in sorted_counts:
         joined = ";".join(["%s:%s" % (a, c) for a, c in counts.items()])
-        sys.stderr.write("%d\t%s\n" % (pos, joined))
+        sys.stderr.write("%s\t%d\t%d\t%s\n" % (refname, block_id, pos, joined))
 
-def group_reads_by_block(block, block_id, bamfile, getmate, callback=None):
+def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, callback=None):
     """
     Take a HapCut hapcut.Block (a single phased block) and a BAM file
     and group the BAM file's reads.
@@ -107,13 +107,13 @@ def group_reads_by_block(block, block_id, bamfile, getmate, callback=None):
         allele_len = len(entry.ref_allele)
         haplotypes[(entry.position-1, entry.position-1 + allele_len, allele_len)] = dict([ref_key, var_key])
 
-    readsets = {0:ReadSet(refname, block_id, 0), 1:ReadSet(refname, block_id, 1)}
+    readsets = (ReadSet(refname, block_id, 0), ReadSet(refname, block_id, 1))
     unused_phased = ReadSet(refname, "NA", "NA")
     stats = Counter()
     allele_counts = defaultdict(Counter)
                 
     for read in bamfile.fetch(refname):
-        if read.is_unmapped:
+        if read.is_unmapped or read.mapq < mapq or (exclude_duplicates and read.is_duplicate):
             continue
         for key, alleles in haplotypes.items():
             interval = key[0:2]
@@ -130,11 +130,11 @@ def group_reads_by_block(block, block_id, bamfile, getmate, callback=None):
                 else:
                     # no indel; can safely grab variant with position offet
                     read_var = read.query[interval[0]-read.pos:interval[1]-read.pos]
-                    allele_counts[interval[0]][read_var] += 1
                     htype = alleles.get(read_var, None)
                     if htype is not None:
                         stats['phased'] += 1
                         readsets[htype].add_read(read)
+                        allele_counts[interval[0]][read_var] += 1
                         read_mate = getmate(read)
                         if read_mate is not None:
                             readsets[htype].add_read(read_mate)
@@ -143,12 +143,14 @@ def group_reads_by_block(block, block_id, bamfile, getmate, callback=None):
                         # read does not have a phased variant
                         unused_phased.add_read(read)
                         stats['unused'] += 1
+    pdb.set_trace()
     print_block_stats(refname, block_id, allele_counts, stats)
     # TODO how to handle mates for phased and unphased
     if callback is not None:
         callback(readsets, unused_phased)
 
-def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_filename, region=None):
+def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_filename,
+                mapq, exclude_duplicates, region=None):
     sys.stderr.write("[phase_reads] opening alignment BAM file...\t")
     bamfile = pysam.Samfile(bam_filename, 'rb')
     sys.stderr.write("done.\n")
@@ -186,7 +188,7 @@ def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_fi
     for refname, phased_blocks in hapcut_dict.iteritems():
         getmate = getmate_factory(refname, bamfile)
         for block_id, block in enumerate(phased_blocks):
-            group_reads_by_block(block, block_id, bamfile, getmate, writer_callback)
+            group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, writer_callback)
     pdb.set_trace()
     
     # TODO handle unphased contigs
@@ -204,7 +206,7 @@ if __name__ == "__main__":
                         help="FASTA filename for reads from phased contigs unused during phasing",
                         type=str, default=None, required=False)
     parser.add_argument("-m", "--mapq", help="mapping quality threshold (exclude if below)", 
-                        type=int, required=False, default=None)
+                        type=int, required=False, default=0)
     parser.add_argument("-d", "--exclude-duplicates", help="exclude duplicate reads", 
                         action="store_true", default=True)
     parser.add_argument("hapcut", help="hapcut file", default=None,
@@ -215,4 +217,5 @@ if __name__ == "__main__":
                         type=str, nargs="?")
 
     args = parser.parse_args()
-    phase_reads(args.bam, args.hapcut, args.phased, args.unused_phased, region=args.region)
+    phase_reads(args.bam, args.hapcut, args.phased, args.unused_phased,
+                args.mapq, args.exclude_duplicates, region=args.region)
