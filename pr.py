@@ -83,12 +83,13 @@ def print_block_stats(refname, block_id, allele_counts, read_stats):
     For each block, print allele counts and the read statistics.
     """
     tmp = (refname, block_id, read_stats['phased'], read_stats['indel_ignore'], read_stats['unused'])
-    sys.stderr.write("# contig='%s' block_id=%d num_phased=%d indel_ignore=%d unused=%d\n" % tmp)
+    sys.stdout.write("# contig='%s' block_id=%d num_phased=%d indel_ignore=%d unused=%d\n" % tmp)
     sorted_counts = sorted(allele_counts.items(), key=itemgetter(0))
     for pos, counts in sorted_counts:
         joined = ";".join(["%s:%s" % (a, c) for a, c in counts.items()])
-        sys.stderr.write("%s\t%d\t%d\t%s\n" % (refname, block_id, pos, joined))
-
+        sys.stdout.write("%s\t%d\t%d\t%s\n" % (refname, block_id, pos, joined))
+    sys.stdout.flush()
+    
 def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, callback=None):
     """
     Take a HapCut hapcut.Block (a single phased block) and a BAM file
@@ -99,6 +100,8 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
     """
     # TODO mapq and dup filtering
     refname = block.entries[0].chromosome
+    sys.stderr.write("[phase_reads] phasing '%s', block_id %d\n" % (refname, block_id))
+    sys.stderr.flush()
     # make a dictionary of all variants in a phased block
     haplotypes = dict()
     for entry in block.entries:
@@ -143,7 +146,6 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
                         # read does not have a phased variant
                         unused_phased.add_read(read)
                         stats['unused'] += 1
-    pdb.set_trace()
     print_block_stats(refname, block_id, allele_counts, stats)
     # TODO how to handle mates for phased and unphased
     if callback is not None:
@@ -189,7 +191,6 @@ def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_fi
         getmate = getmate_factory(refname, bamfile)
         for block_id, block in enumerate(phased_blocks):
             group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, writer_callback)
-    pdb.set_trace()
     
     # TODO handle unphased contigs
     unphased_contigs = set(bamfile.references) - set(hapcut_dict.keys())
