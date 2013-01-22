@@ -20,6 +20,16 @@ directly.
 
 ## Limitations
 
-**Indels** are not handled: `pr.py` currently ignores reads with
+ - Indels are not handled: `pr.py` currently ignores reads with
   indels, because they displace other variants.
 
+
+## Todo
+
+ - Refactor to use two distinct subcommands: one for outputting reads,
+   one for assembling reads via fermi.
+
+ - Add asynchronous callback functions for assembly that could be used
+   for running assemblies during phasing.
+
+ - Multiprocessing.

@@ -36,6 +36,12 @@ class ReadSet(object):
         if TEST and None not in self.readset[read.qname]:
             assert(self.readset[read.qname][which_read] == seq)
         self.readset[read.qname][which_read] = seq
+
+    @property
+    def name(self):
+        fields = (self.refname, self.block, self.haplotype)
+        return "%s_%s_%s" % fields
+    
     def write_reads(self, file_handle):
         for qname, seqs in self.readset.iteritems():
             for i, seq in enumerate(seqs):
@@ -45,6 +51,12 @@ class ReadSet(object):
                 fields = map(str, (qname, which, self.refname, self.block, self.haplotype))
                 header = "%s-%s %s_%s_%s" % tuple(fields)
                 file_handle.write(">%s\n%s\n" % (header, seq))
+    def __iter__(self):
+        for read_group in self.readset.values():
+            # read_group is both pairs
+            for read in read_group:
+                if read is not None:
+                    yield read
 
 def revcomp(seq):
     return str(Seq(seq).reverse_complement())
@@ -152,7 +164,7 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
         callback(readsets, unused_phased)
 
 def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_filename,
-                mapq, exclude_duplicates, region=None):
+                contig_filename, mapq, exclude_duplicates, region=None):
     sys.stderr.write("[phase_reads] opening alignment BAM file...\t")
     bamfile = pysam.Samfile(bam_filename, 'rb')
     sys.stderr.write("done.\n")
@@ -165,6 +177,11 @@ def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_fi
     if unused_phased_filename is not None:
         sys.stderr.write("[phase_reads] opening FASTA file for unused phased reads...\t")
         unused_phasedfile = open(unused_phased_filename, 'w')
+        sys.stderr.write("done.\n")
+
+    if contig_filename is not None:
+        sys.stderr.write("[phase_reads] opening FASTA file for phased contigs...\t")
+        contigfile = open(contig_filename, 'w')
         sys.stderr.write("done.\n")
 
     hapcut_dict = HapCut(open(hapcut_filename, 'r')).to_dict()
@@ -180,17 +197,24 @@ def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_fi
             unused_readset.write_reads(unused_phasedfile)
 
     def assembly_callback(phased_readset, unused_readset):
-        # TODO 
+        if unused_phased_filename is not None:
+            unused_readset.write_reads(unused_phasedfile)
         fermi = fm.Fermi()
-        for read in readsets[0]:
-            fermi.addseq(read.query)
+        for readset in phased_readset:
+            for read in readset:
+                fermi.addseq(read)
             fermi.correct()
             tigs = fermi.assemble(do_clean=True)
+            root_name = readset.name
+            tigs = fermi.fastq_to_list(tigs, root_name)
+            for tig in tigs:
+                contigfile.write(">%s\n%s\n" % (tig.header, tig.seq))
 
     for refname, phased_blocks in hapcut_dict.iteritems():
         getmate = getmate_factory(refname, bamfile)
         for block_id, block in enumerate(phased_blocks):
-            group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, writer_callback)
+            group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates,
+                                 getmate, assembly_callback)
     
     # TODO handle unphased contigs
     unphased_contigs = set(bamfile.references) - set(hapcut_dict.keys())
@@ -202,9 +226,12 @@ if __name__ == "__main__":
     parser.add_argument("-u", "--unphased", help="FASTA filename for reads from unphased contigs",
                         type=str, default=None, required=False)
     parser.add_argument("-p", "--phased", help="FASTA filename for reads from phased contigs",
-                        type=str, required=True)
+                        type=str, default=None)
     parser.add_argument("-o", "--unused-phased",
                         help="FASTA filename for reads from phased contigs unused during phasing",
+                        type=str, default=None)
+    parser.add_argument("-c", "--contigs",
+                        help="FASTA filename for assembled phasedc contigs",
                         type=str, default=None, required=False)
     parser.add_argument("-m", "--mapq", help="mapping quality threshold (exclude if below)", 
                         type=int, required=False, default=0)
@@ -219,4 +246,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     phase_reads(args.bam, args.hapcut, args.phased, args.unused_phased,
+                args.contigs,
                 args.mapq, args.exclude_duplicates, region=args.region)
