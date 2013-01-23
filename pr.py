@@ -199,8 +199,8 @@ def phase_reads(bam_filename, hapcut_filename, phased_filename, unused_phased_fi
     def assembly_callback(phased_readset, unused_readset):
         if unused_phased_filename is not None:
             unused_readset.write_reads(unused_phasedfile)
-        fermi = fm.Fermi()
         for readset in phased_readset:
+            fermi = fm.Fermi()
             for read in readset:
                 fermi.addseq(read)
             fermi.correct()
