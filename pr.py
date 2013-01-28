@@ -183,21 +183,22 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
                                  getmate, callback)
     
     # handle unphased contigs
-    unphased_contigs = set(bamfile.references) - set(hapcut_dict.keys())
-    for read in bamfile:
-        if (read not in unphased_contigs or read.is_unmapped or
-            read.mapq < mapq or (exclude_duplicates and read.is_duplicate)):
-            continue
-        which_read = 1 if read.is_read1 else 2
-        seq = read.seq
-        qual = read.qual
-        if read.is_reverse:
-            seq = revcomp(seq)
-            qual = qual[::-1]
-        fields = map(str, (read.qname, which_read, bamfile.getrname[read.tid]))
-        # NP: not phased
-        header = "%s-%s CT:NP BL:NP PH:NP" % tuple(fields)
-        unphased_file.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
+    if unphased_file is not None:
+        unphased_contigs = set(bamfile.references) - set(hapcut_dict.keys())
+        for read in bamfile:
+            if (read not in unphased_contigs or read.is_unmapped or
+                read.mapq < mapq or (exclude_duplicates and read.is_duplicate)):
+                continue
+            which_read = 1 if read.is_read1 else 2
+            seq = read.seq
+            qual = read.qual
+            if read.is_reverse:
+                seq = revcomp(seq)
+                qual = qual[::-1]
+            fields = map(str, (read.qname, which_read, bamfile.getrname[read.tid]))
+            # NP: not phased
+            header = "%s-%s CT:NP BL:NP PH:NP" % tuple(fields)
+            unphased_file.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
 
 def assemble_main(args):
     """
