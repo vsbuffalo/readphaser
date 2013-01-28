@@ -220,6 +220,7 @@ def assemble_main(args):
             if tigs is None:
                 # annotate as NC: no contigs
                 readset.write_reads(args.unused_phased, add="NC")
+                return 
             root_name = readset.name
             tigs = fermi.fastq_to_list(tigs, root_name)
             for tig in tigs:
