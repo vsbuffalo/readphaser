@@ -211,12 +211,10 @@ def assemble_main(args):
     def assembly_callback(phased_readset, unused_readset):
         if args.unused_phased is not None:
             unused_readset.write_reads(args.unused_phased)
-        if len(phased_readset) == 0:
-            # annotate as NC: no contigs
-            readset.write_reads(args.unused_phased, add="NC")
-            return 
         for readset in phased_readset:
             fermi = fm.Fermi()
+            if len(readset) == 0:
+                return
             for seq, qual in readset:
                 fermi.addseq(seq, qual)
             fermi.correct()
