@@ -47,7 +47,7 @@ class ReadSet(object):
         fields = (self.refname, self.block, self.haplotype)
         return "CT:%s BL:%s PH:%s" % fields
     
-    def write_reads(self, file_handle):
+    def write_reads(self, file_handle, add=None):
         for qname, seqs in self.readset.iteritems():
             for i, seq in enumerate(seqs):
                 if seq is None:
@@ -55,6 +55,8 @@ class ReadSet(object):
                 which = i + 1
                 fields = map(str, (qname, which, self.refname, self.block, self.haplotype))
                 header = "%s-%s CT:%s BL:%s PH:%s" % tuple(fields)
+                if add is not None:
+                    header += " IF:%s" % add
                 file_handle.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
     def __iter__(self):
         for read_group in self.readset.values():
@@ -215,6 +217,9 @@ def assemble_main(args):
                 fermi.addseq(seq, qual)
             fermi.correct()
             tigs = fermi.assemble(do_clean=True)
+            if tigs is None:
+                # annotate as NC: no contigs
+                readset.write_reads(args.unused_phased, add="NC")
             root_name = readset.name
             tigs = fermi.fastq_to_list(tigs, root_name)
             for tig in tigs:
