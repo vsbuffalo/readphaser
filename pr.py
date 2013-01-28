@@ -77,7 +77,7 @@ def getmate_factory(refname, bamfile):
     be handled elsewhere.
     """
     reads = defaultdict(dict)
-    for read in bamfile.fetch(region=refname):
+    for read in bamfile.fetch(reference=refname):
         which_read = 0 if read.is_read1 else 1
         reads[read.qname][which_read] = read
 
