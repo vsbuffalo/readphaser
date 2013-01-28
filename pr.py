@@ -42,6 +42,9 @@ class ReadSet(object):
             assert(self.readset[read.qname][which_read][0] == seq)
         self.readset[read.qname][which_read] = (seq, qual)
 
+    def __len__(self):
+        return len(self.readset)
+
     @property
     def name(self):
         fields = (self.refname, self.block, self.haplotype)
