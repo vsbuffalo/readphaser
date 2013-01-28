@@ -253,10 +253,13 @@ if __name__ == "__main__":
                                  action="store_true", default=True)
     parser_assemble.add_argument("-c", "--contigs",
                                  help="FASTA filename for assembled phasedc contigs",
-                                 type=argparse.FileType('w'), default=None, required=False)
+                                 type=argparse.FileType('w'), default=None)
     parser_assemble.add_argument("-o", "--unused-phased",
                                  help="FASTA filename for reads from phased "
                                  "contigs unused during phasing",
+                                 type=argparse.FileType('w'), default=None)
+    parser_assemble.add_argument("-u", "--unphased",
+                                 help="FASTA filename for reads from unphased contigs",
                                  type=argparse.FileType('w'), default=None)
 
     parser_output = subparsers.add_parser('output', help='output phased reads to file')
