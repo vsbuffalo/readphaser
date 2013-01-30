@@ -8,6 +8,8 @@ block info and a list of block entries (phased variants).
 TEST = True
 import pdb
 import sys
+from multiprocessing import Queue, Pool, Process
+from Queue import Empty
 import argparse
 from collections import defaultdict, OrderedDict, Counter
 from operator import itemgetter
@@ -49,7 +51,24 @@ class ReadSet(object):
     def name(self):
         fields = (self.refname, self.block, self.haplotype)
         return "CT:%s BL:%s PH:%s" % fields
-    
+
+    def str_reads(self, add=None):
+        """
+        FASTQ stringified version if reads.
+        """
+        out = list()
+        for qname, seqs in self.readset.iteritems():
+            for i, seq in enumerate(seqs):
+                if seq is None:
+                    continue
+                which = i + 1
+                fields = map(str, (qname, which, self.refname, self.block, self.haplotype))
+                header = "%s-%s CT:%s BL:%s PH:%s" % tuple(fields)
+                if add is not None:
+                    header += " " + add
+                out.append("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
+        return out
+                
     def write_reads(self, file_handle, add=None):
         for qname, seqs in self.readset.iteritems():
             for i, seq in enumerate(seqs):
@@ -59,7 +78,7 @@ class ReadSet(object):
                 fields = map(str, (qname, which, self.refname, self.block, self.haplotype))
                 header = "%s-%s CT:%s BL:%s PH:%s" % tuple(fields)
                 if add is not None:
-                    header += " IF:%s" % add
+                    header += " " + add
                 file_handle.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
     def __iter__(self):
         for read_group in self.readset.values():
@@ -205,11 +224,74 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
             header = "%s-%s CT:NP BL:NP PH:NP" % tuple(fields)
             unphased_file.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
 
+def assembly_worker(phased_readsets, unused_readset):
+    """
+    assembly_worker() takes a list of phased_readsets (one for each
+    haplotype, and recall that this is already at the *block* level)
+    and a unused_readset (reads that were unable to be phased).
+
+    assembly_worker() outputs a tuple of phased contig strings (in
+    FASTA format), and a FASTA string of unused
+    reads. assembly_worker() expects these to be handled via
+    consume_and_write(), but handled by a queue in the interim.
+
+    If the assembly fails to produce contigs, all reads from a phased
+    readset are added to unused with the additional key:value of IF:NC
+    for InFo: No Contigs.
+    """
+    phased_fasta_strs = list()
+    unused_fasta_strs = unused_readset.str_reads()
+    for readset in phased_readsets:
+        fermi = fm.Fermi()
+        if len(readset) == 0:
+            return
+        for seq, qual in readset:
+            fermi.addseq(seq, qual)
+        fermi.correct()
+        tigs = fermi.assemble(do_clean=True)
+        if tigs is None:
+            # annotate as NC: no contigs
+            unused_fasta_strs.extend(readset.str_reads(add="IF:NC"))
+            return 
+        root_name = readset.name
+        tigs = fermi.fastq_to_list(tigs, root_name)
+        for tig in tigs:
+            phased_fasta_strs.append(">%s\n%s\n" % (tig.header, tig.seq))
+    return (phased_fasta_strs, unused_fasta_strs)
+
+def consume_and_write(queue, contig_file, unused_file):
+    """
+    consume_and_write() takes tuples from a queue until it encounters
+    None (which functions as a stop token). Each tuple is from
+    assembly_worker(), which uses pyfermi to assembly reads. The
+    assembly results (contigs) are the first item, and unused reads
+    are the second item. This must not be run in parallel, as writing
+    should only be done by once process, interacting with a single
+    file handle.
+    """
+    while True:
+        val = queue.get()
+        if val is None:
+            break
+        for file, results in zip([contig_file, unused_file], val):
+            if file is None:
+                continue # user wishes not to output this info
+            for result in results:
+                if len(result) > 0:
+                    file.write(result)
+        
 def assemble_main(args):
     """
     main() function for assembly with fermi. This also defines a
     closure callback function over some of the arguments.
     """
+    num_procs = args.num_procs
+
+    if num_procs > 1:
+        worker_pool = Pool(num_procs)
+        output_queue = Queue()
+        consumer_process = Process(target=consume_and_write, args=(output_queue, args.contigs, args.unused_phased))
+        consumer_process.start()
     
     def assembly_callback(phased_readset, unused_readset):
         if args.unused_phased is not None:
@@ -224,16 +306,36 @@ def assemble_main(args):
             tigs = fermi.assemble(do_clean=True)
             if tigs is None:
                 # annotate as NC: no contigs
-                readset.write_reads(args.unused_phased, add="NC")
+                readset.write_reads(args.unused_phased, add="IF:NC")
                 return 
             root_name = readset.name
             tigs = fermi.fastq_to_list(tigs, root_name)
             for tig in tigs:
                 args.contigs.write(">%s\n%s\n" % (tig.header, tig.seq))
 
+    def mp_assembly_callback(phased_readset, unused_readset):
+        """
+        mp_assembly_callback() is multiprocessor assembly callback,
+        used if the num_procs > 1.
+        """
+        worker_pool.apply_async(assembly_worker, args=(phased_readset, unused_readset),
+                                callback=output_queue.put)
+    if num_procs > 1:
+        callback = mp_assembly_callback
+    else:
+        callback = assembly_callback
+
     phase_reads(args.bam, args.hapcut, args.unphased, args.mapq,
-                args.exclude_duplicates, assembly_callback,
+                args.exclude_duplicates, callback=callback,
                 region=args.region)
+
+    if num_procs > 1:
+        worker_pool.close()
+        worker_pool.join()
+        output_queue.put(None)
+        output_queue.close()
+        consumer_process.join()
+    
 
 def output_main(args):
     """
@@ -272,6 +374,9 @@ if __name__ == "__main__":
     parser_assemble.add_argument("-u", "--unphased",
                                  help="FASTA filename for reads from unphased contigs",
                                  type=argparse.FileType('w'), default=None)
+    parser_assemble.add_argument("-P", "--num-procs",
+                                 help="number of processors to use",
+                                 type=int, default=1)
 
     parser_output = subparsers.add_parser('output', help='output phased reads to file')
     parser_output.add_argument("-u", "--unphased",
