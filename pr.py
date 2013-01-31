@@ -4,6 +4,11 @@ pr.py -- phasereads.py
 hapcut.HapCut() takes a hapcut file and returns a dictionary of
 refnames and a list of hapcut.Blocks. Each hapcut.Block contains
 block info and a list of block entries (phased variants).
+
+
+TODO:
+ - check total read counts
+ - check allele counts
 """
 TEST = True
 import pdb
@@ -22,6 +27,14 @@ def revcomp(seq):
     return str(Seq(seq).reverse_complement())
 
 class ReadSet(object):
+    """
+    ReadSets are a lightweight way of storing paired-end reads in a
+    way that ensures the same read (identified by read name) is not
+    stored more than once (thus, a set). This encapsulates a dict with
+    read names as the key and a list of two as the value. The list is
+    to store pairs, in order. Each pair is composed of a tuple of
+    (seq, qual).
+    """
     def __init__(self, refname, block, haplotype):
         self.refname = refname
         self.block = block
@@ -80,7 +93,12 @@ class ReadSet(object):
                 if add is not None:
                     header += " " + add
                 file_handle.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
+
     def __iter__(self):
+        """
+        Iterate through a readset, yielding each read. This is
+        irrespective of which member of a pair it is.
+        """
         for read_group in self.readset.values():
             # read_group is both pairs
             for read in read_group:
@@ -131,10 +149,23 @@ def print_block_stats(refname, block_id, allele_counts, read_stats):
 def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, callback=None):
     """
     Take a HapCut hapcut.Block (a single phased block) and a BAM file
-    and group the BAM file's reads.
+    and group the BAM file's reads by phased variant. Specifically,
+    the *first* phased in a read; not all variants are checked for
+    consistency. Since this is downstream of HapCut (which uses read
+    data to phase haplotypes), phase across a read should be
+    consistent, so this should be a safe behavior.
+
+    Arguments
+     - block: a phased Block named tuple
+     - block_id: string indicating block id [0, n]
+     - bamfike: an open bamfile from pysam
+     - mapq: threshold mapping quality
+     - exclude_duplicates: exclude reads that have an optical duplicate FLAG
+     - getmate: a closure created by getmate_factory() that wraps mate data
+     - callback: a callback function that takes the phased_readset list and the unused_readset 
 
     Intervals are 0-indexed. HapCut is 1-indexed (thus,
-    entry.position-1). 
+    entry.position-1).
     """
     refname = block.entries[0].chromosome
     sys.stderr.write("[phase_reads] phasing '%s', block_id %d\n" % (refname, block_id))
@@ -151,10 +182,15 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
     unused_phased = ReadSet(refname, "NA", "NA")
     stats = Counter()
     allele_counts = defaultdict(Counter)
-                
     for read in bamfile.fetch(refname):
         if read.is_unmapped or read.mapq < mapq or (exclude_duplicates and read.is_duplicate):
+            unused_phased.add_read(read)
             continue
+        # For each read, we want to assess whether it is consistent
+        # across a set of variants that span it. This is done by using
+        # a counter of phased variants.
+        htypes_counts = Counter()
+        
         for key, alleles in haplotypes.items():
             interval = key[0:2]
             allele_len = key[2]
@@ -171,18 +207,37 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
                     # no indel; can safely grab variant with position offet
                     read_var = read.query[interval[0]-read.pos:interval[1]-read.pos]
                     htype = alleles.get(read_var, None)
-                    if htype is not None:
-                        stats['phased'] += 1
-                        readsets[htype].add_read(read)
-                        allele_counts[interval[0]][read_var] += 1
-                        read_mate = getmate(read)
-                        if read_mate is not None:
-                            readsets[htype].add_read(read_mate)
-                            stats['phased_mates'] += 1
-                    else:
-                        # read does not have a phased variant
-                        unused_phased.add_read(read)
-                        stats['unused'] += 1
+                    htypes_counts[htype] += 1
+            else:
+                unused_phased.add_read(read)
+                stats['indel_ignore'] += 1
+
+        if len(htypes_counts) == 0:
+            unused_phased.add_read(read)
+            stats['indel_ignore'] += 1
+
+        if set([0, 1]) == set(v for v in htypes_counts.keys() if v is not None):
+            print htypes_counts
+            pdb.set_trace()
+        # if len(htypes_counts) == 1:
+        #     htype = htypes_counts.keys()[0]
+        #     # this read has a single consistent haplotype
+        #     if htype is not None:
+        #         stats['phased'] += 1
+        #         readsets[htype].add_read(read)
+        #         allele_counts[interval[0]][read_var] += 1
+        #         read_mate = getmate(read)
+        #         if read_mate is not None:
+        #             readsets[htype].add_read(read_mate)
+        #             stats['phased_mates'] += 1
+        #     else:
+        #         # read does not have a phased variant
+        #         unused_phased.add_read(read)
+        #         stats['unused'] += 1
+        # else:
+        #     pass
+        #     #pdb.set_trace()
+
     print_block_stats(refname, block_id, allele_counts, stats)
     # TODO how to handle mates for phased and unphased
     if callback is not None:
@@ -190,7 +245,25 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
 
 def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicates,
                 callback, region=None):
+    """
+    phase_reads() is the primary function that dispatches
+    group_reads_by_block() per block. Given a BAM filebame, HapCut
+    file, and unphased_file for contigs that have not been phased (not
+    in HapCut's output) this will call group_reads_by_block() and
+    phase blocks. Results are passed as a tuple (phased_readset, and
+    unused_readset) to a callback function. Optionally, a region can
+    be provided.
 
+    mapq and exclude_duplicates are for filtering reads used in
+    phasing, and should match the options chosen by HapCut and
+    FreeBayes.
+
+    As an aside, a callback is used so that if further processing is
+    needed (like with the assembly option), it can be done
+    asynchronously in another process (or many processes). A callback
+    also allows a universal phase_reads() function for the 'assemble'
+    and 'output' subcommands.
+    """
     sys.stderr.write("[phase_reads] opening alignment BAM file...\t")
     bamfile = pysam.Samfile(bam_filename, 'rb')
     sys.stderr.write("done.\n")
@@ -224,7 +297,7 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
             header = "%s-%s CT:NP BL:NP PH:NP" % tuple(fields)
             unphased_file.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
 
-def assembly_worker(phased_readsets, unused_readset):
+def assembly_worker(phased_readsets, unused_readset, k):
     """
     assembly_worker() takes a list of phased_readsets (one for each
     haplotype, and recall that this is already at the *block* level)
@@ -248,7 +321,7 @@ def assembly_worker(phased_readsets, unused_readset):
         for seq, qual in readset:
             fermi.addseq(seq, qual)
         fermi.correct()
-        tigs = fermi.assemble(do_clean=True)
+        tigs = fermi.assemble(unitig_k=k, do_clean=True)
         if tigs is None:
             # annotate as NC: no contigs
             unused_fasta_strs.extend(readset.str_reads(add="IF:NC"))
@@ -256,7 +329,7 @@ def assembly_worker(phased_readsets, unused_readset):
         root_name = readset.name
         tigs = fermi.fastq_to_list(tigs, root_name)
         for tig in tigs:
-            phased_fasta_strs.append(">%s\n%s\n" % (tig.header, tig.seq))
+            phased_fasta_strs.append("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
     return (phased_fasta_strs, unused_fasta_strs)
 
 def consume_and_write(queue, contig_file, unused_file):
@@ -273,24 +346,26 @@ def consume_and_write(queue, contig_file, unused_file):
         val = queue.get()
         if val is None:
             break
-        for file, results in zip([contig_file, unused_file], val):
-            if file is None:
+        for outfile, results in zip([contig_file, unused_file], val):
+            if outfile is None:
                 continue # user wishes not to output this info
             for result in results:
                 if len(result) > 0:
-                    file.write(result)
+                    outfile.write(result)
         
 def assemble_main(args):
     """
-    main() function for assembly with fermi. This also defines a
-    closure callback function over some of the arguments.
+    Main function for assembly with fermi. This also defines a closure
+    callback function over some of the arguments.
     """
     num_procs = args.num_procs
 
     if num_procs > 1:
+        sys.stderr.write("[phase_reads] opening %d threads...\n" % num_procs)
         worker_pool = Pool(num_procs)
         output_queue = Queue()
-        consumer_process = Process(target=consume_and_write, args=(output_queue, args.contigs, args.unused_phased))
+        consumer_process = Process(target=consume_and_write,
+                                   args=(output_queue, args.contigs, args.unused_phased))
         consumer_process.start()
     
     def assembly_callback(phased_readset, unused_readset):
@@ -303,7 +378,7 @@ def assemble_main(args):
             for seq, qual in readset:
                 fermi.addseq(seq, qual)
             fermi.correct()
-            tigs = fermi.assemble(do_clean=True)
+            tigs = fermi.assemble(unitig_k=args.k, do_clean=True)
             if tigs is None:
                 # annotate as NC: no contigs
                 readset.write_reads(args.unused_phased, add="IF:NC")
@@ -311,14 +386,14 @@ def assemble_main(args):
             root_name = readset.name
             tigs = fermi.fastq_to_list(tigs, root_name)
             for tig in tigs:
-                args.contigs.write(">%s\n%s\n" % (tig.header, tig.seq))
+                args.contigs.write("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
 
     def mp_assembly_callback(phased_readset, unused_readset):
         """
         mp_assembly_callback() is multiprocessor assembly callback,
         used if the num_procs > 1.
         """
-        worker_pool.apply_async(assembly_worker, args=(phased_readset, unused_readset),
+        worker_pool.apply_async(assembly_worker, args=(phased_readset, unused_readset, args.k),
                                 callback=output_queue.put)
     if num_procs > 1:
         callback = mp_assembly_callback
@@ -377,6 +452,7 @@ if __name__ == "__main__":
     parser_assemble.add_argument("-P", "--num-procs",
                                  help="number of processors to use",
                                  type=int, default=1)
+    parser_assemble.add_argument("-k", help="k-mer size for assembly, default: let fermi choose ", type=int, default=None)
 
     parser_output = subparsers.add_parser('output', help='output phased reads to file')
     parser_output.add_argument("-u", "--unphased",
