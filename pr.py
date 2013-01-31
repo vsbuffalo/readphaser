@@ -5,6 +5,10 @@ hapcut.HapCut() takes a hapcut file and returns a dictionary of
 refnames and a list of hapcut.Blocks. Each hapcut.Block contains
 block info and a list of block entries (phased variants).
 
+Notes:
+
+ - I use custom exceptions to handle specific types of issues in
+   reads.
 
 TODO:
  - check total read counts
@@ -22,88 +26,34 @@ import pysam
 from Bio.Seq import Seq
 from hapcut import HapCut
 import fermi as fm
+from readset import ReadSet
 
-def revcomp(seq):
-    return str(Seq(seq).reverse_complement())
-
-class ReadSet(object):
+class ContainsIndel(Exception):
     """
-    ReadSets are a lightweight way of storing paired-end reads in a
-    way that ensures the same read (identified by read name) is not
-    stored more than once (thus, a set). This encapsulates a dict with
-    read names as the key and a list of two as the value. The list is
-    to store pairs, in order. Each pair is composed of a tuple of
-    (seq, qual).
+    ContainsIndels is a simple Exception for reads that contain
+    indels.
     """
-    def __init__(self, refname, block, haplotype):
-        self.refname = refname
-        self.block = block
-        self.haplotype = haplotype
-        self.readset = dict()
-    def add_read(self, read):
-        """
-        Add a read, modifying header to include the contig and phasing
-        info. Also, look at mapping orientation and reverse if necessary.
-        """
-        if read.qname not in self.readset:
-            self.readset[read.qname] = [None, None]
-        which_read = 0 if read.is_read1 else 1
-        seq = read.seq
-        qual = read.qual
-        if read.is_reverse:
-            seq = revcomp(seq)
-            qual = qual[::-1]
-        if TEST and None not in self.readset[read.qname]:
-            assert(self.readset[read.qname][which_read][0] == seq)
-        self.readset[read.qname][which_read] = (seq, qual)
+    def __init__(self, read):
+        self.read = read
+        self.name = "indel"
 
-    def __len__(self):
-        return len(self.readset)
+class NoOverlap(Exception):
+    """
+    NoOverlap is a simple Exception for reads with no overlap with a
+    phased variant.
+    """
+    def __init__(self, read):
+        self.read = read
+        self.name = "no-overlap"
 
-    @property
-    def name(self):
-        fields = (self.refname, self.block, self.haplotype)
-        return "CT:%s BL:%s PH:%s" % fields
-
-    def str_reads(self, add=None):
-        """
-        FASTQ stringified version if reads.
-        """
-        out = list()
-        for qname, seqs in self.readset.iteritems():
-            for i, seq in enumerate(seqs):
-                if seq is None:
-                    continue
-                which = i + 1
-                fields = map(str, (qname, which, self.refname, self.block, self.haplotype))
-                header = "%s-%s CT:%s BL:%s PH:%s" % tuple(fields)
-                if add is not None:
-                    header += " " + add
-                out.append("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
-        return out
-                
-    def write_reads(self, file_handle, add=None):
-        for qname, seqs in self.readset.iteritems():
-            for i, seq in enumerate(seqs):
-                if seq is None:
-                    continue
-                which = i + 1
-                fields = map(str, (qname, which, self.refname, self.block, self.haplotype))
-                header = "%s-%s CT:%s BL:%s PH:%s" % tuple(fields)
-                if add is not None:
-                    header += " " + add
-                file_handle.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
-
-    def __iter__(self):
-        """
-        Iterate through a readset, yielding each read. This is
-        irrespective of which member of a pair it is.
-        """
-        for read_group in self.readset.values():
-            # read_group is both pairs
-            for read in read_group:
-                if read is not None:
-                    yield read
+class UnphasedVariant(Exception):
+    """
+    UnphasedVariant is a simple Exception for reads that contain an
+    allele that is unphased at a phased loci.
+    """
+    def __init__(self, read):
+        self.read = read
+        self.name = "unphased"
 
 def has_indel(read):
     return any([op in (1, 2) for op, _ in read.cigar])
@@ -134,6 +84,9 @@ def getmate_factory(refname, bamfile):
 
     return getter
 
+def revcomp(seq):
+    return str(Seq(seq).reverse_complement())
+
 def print_block_stats(refname, block_id, allele_counts, read_stats):
     """
     For each block, print allele counts and the read statistics.
@@ -145,15 +98,75 @@ def print_block_stats(refname, block_id, allele_counts, read_stats):
         joined = ";".join(["%s:%s" % (a, c) for a, c in counts.items()])
         sys.stdout.write("%s\t%d\t%d\t%s\n" % (refname, block_id, pos, joined))
     sys.stdout.flush()
+
+def pass_filters(read, mapq=0, exclude_duplicates=False):
+    """
+    Function for filtering reads, primarily for clarity. Read must be
+    mapped, and have sufficient quality and not be a duplicate,
+    depending on args.
+    """
+    if exclude_duplicates and read.is_duplicate:
+        return False
+    return (not read.is_unmapped) and read.mapq >= mapq
+
+def get_block_haplotypes(block):
+    """
+    Given a block from HapCut's Block named tuple, make a dictionary
+    of all variants and positions. Keys are typles of:
+     - start position
+     - end position
+     - length
+    """
+    haplotypes = dict()
+    for entry in block.entries:
+        ref_key = (entry.ref_allele, entry.haplotype_1)
+        var_key = (entry.var_allele, entry.haplotype_2)
+        allele_len = len(entry.ref_allele)
+        allele_tup = (entry.position-1, entry.position-1 + allele_len, allele_len)
+        haplotypes[allele_tup] = dict([ref_key, var_key])
+    return haplotypes
+
+def count_read_haplotypes(read, haplotypes):
+    """
+    Given an AlignedRead and a haplotype dictionary from
+    get_block_haplotypes(), this raises an Exception for unhandled
+    cases, or returns a Counter object the the haplotype counts in a
+    read. 
+    """
+    # For each read, we want to assess whether it is consistent
+    # across a set of variants that span it. This is done by using
+    # a counter of phased variants.
+    htypes_counts = Counter()
+
+    for key, alleles in haplotypes.items():
+        # alleles is dict of allele:phase
+        interval = key[0:2]
+        allele_len = key[2]
+        if read.overlap(interval[0], interval[1]) == allele_len:
+            # full overlap of variant - necessary for multibase variants
+
+            # check for indel, which will break our variant
+            # retrieval.
+            if has_indel(read):
+                raise ContainsIndel(read)
+            else:
+                # no indel; can safely grab variant with position offet
+                read_var = read.query[interval[0]-read.pos:interval[1]-read.pos]
+                htype = alleles.get(read_var, None)
+                if htype is None:
+                    raise UnphasedVariant(read)
+                htypes_counts[htype] += 1
+
+    if len(htypes_counts) == 0:
+        raise NoOverlap(read)
+    
+    return htypes_counts
+
     
 def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, callback=None):
     """
     Take a HapCut hapcut.Block (a single phased block) and a BAM file
-    and group the BAM file's reads by phased variant. Specifically,
-    the *first* phased in a read; not all variants are checked for
-    consistency. Since this is downstream of HapCut (which uses read
-    data to phase haplotypes), phase across a read should be
-    consistent, so this should be a safe behavior.
+    and group the BAM file's reads by phased variants.
 
     Arguments
      - block: a phased Block named tuple
@@ -170,73 +183,33 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
     refname = block.entries[0].chromosome
     sys.stderr.write("[phase_reads] phasing '%s', block_id %d\n" % (refname, block_id))
     sys.stderr.flush()
-    # make a dictionary of all variants in a phased block
-    haplotypes = dict()
-    for entry in block.entries:
-        ref_key = (entry.ref_allele, entry.haplotype_1)
-        var_key = (entry.var_allele, entry.haplotype_2)
-        allele_len = len(entry.ref_allele)
-        haplotypes[(entry.position-1, entry.position-1 + allele_len, allele_len)] = dict([ref_key, var_key])
 
-    readsets = (ReadSet(refname, block_id, 0), ReadSet(refname, block_id, 1))
-    unused_phased = ReadSet(refname, "NA", "NA")
+    # make a dictionary of all variants in a phased block
+    haplotypes = get_block_haplotypes(block)
+
+    # initiate data structures and counters for this block
+    readsets = (ReadSet(CT=refname, BL=block_id, PH=0), ReadSet(CT=refname, BL=block_id, PH=1))
+    unused_phased = ReadSet(CT=refname, BL="NA", PH="NA")
     stats = Counter()
     allele_counts = defaultdict(Counter)
+    
     for read in bamfile.fetch(refname):
-        if read.is_unmapped or read.mapq < mapq or (exclude_duplicates and read.is_duplicate):
-            unused_phased.add_read(read)
+        # if False or not pass_filters(read, mapq, exclude_duplicates):
+        #     stats['filtered'] += 1
+        #     unused_phased.add_read(read)
+        #     continue
+
+        try:
+            htype_counts = count_read_haplotypes(read, haplotypes)
+        except (ContainsIndel, NoOverlap, UnphasedVariant) as e:
+            # exceptions used for clarity in logging
+            unused_phased.add_read(e.read)
+            stats[e.name] += 1
             continue
-        # For each read, we want to assess whether it is consistent
-        # across a set of variants that span it. This is done by using
-        # a counter of phased variants.
-        htypes_counts = Counter()
+
         
-        for key, alleles in haplotypes.items():
-            interval = key[0:2]
-            allele_len = key[2]
-            if read.overlap(interval[0], interval[1]) == allele_len:
-                # full overlap of variant - necessary for multibase variants
-
-                # check for indel, which will break our variant
-                # retrieval.
-                if has_indel(read):
-                    # TODO: we are losing reads here... possibly many
-                    unused_phased.add_read(read)
-                    stats['indel_ignore'] += 1
-                else:
-                    # no indel; can safely grab variant with position offet
-                    read_var = read.query[interval[0]-read.pos:interval[1]-read.pos]
-                    htype = alleles.get(read_var, None)
-                    htypes_counts[htype] += 1
-            else:
-                unused_phased.add_read(read)
-                stats['indel_ignore'] += 1
-
-        if len(htypes_counts) == 0:
-            unused_phased.add_read(read)
-            stats['indel_ignore'] += 1
-
-        if set([0, 1]) == set(v for v in htypes_counts.keys() if v is not None):
-            print htypes_counts
-            pdb.set_trace()
-        # if len(htypes_counts) == 1:
-        #     htype = htypes_counts.keys()[0]
-        #     # this read has a single consistent haplotype
-        #     if htype is not None:
-        #         stats['phased'] += 1
-        #         readsets[htype].add_read(read)
-        #         allele_counts[interval[0]][read_var] += 1
-        #         read_mate = getmate(read)
-        #         if read_mate is not None:
-        #             readsets[htype].add_read(read_mate)
-        #             stats['phased_mates'] += 1
-        #     else:
-        #         # read does not have a phased variant
-        #         unused_phased.add_read(read)
-        #         stats['unused'] += 1
-        # else:
-        #     pass
-        #     #pdb.set_trace()
+        
+    print stats
 
     print_block_stats(refname, block_id, allele_counts, stats)
     # TODO how to handle mates for phased and unphased
@@ -324,7 +297,8 @@ def assembly_worker(phased_readsets, unused_readset, k):
         tigs = fermi.assemble(unitig_k=k, do_clean=True)
         if tigs is None:
             # annotate as NC: no contigs
-            unused_fasta_strs.extend(readset.str_reads(add="IF:NC"))
+            readset.add_keyval(IF="NC")
+            unused_fasta_strs.extend(str(readset))
             return 
         root_name = readset.name
         tigs = fermi.fastq_to_list(tigs, root_name)
@@ -370,7 +344,7 @@ def assemble_main(args):
     
     def assembly_callback(phased_readset, unused_readset):
         if args.unused_phased is not None:
-            unused_readset.write_reads(args.unused_phased)
+                unused_readset.write(args.unused_phased)
         for readset in phased_readset:
             fermi = fm.Fermi()
             if len(readset) == 0:
@@ -380,13 +354,17 @@ def assemble_main(args):
             fermi.correct()
             tigs = fermi.assemble(unitig_k=args.k, do_clean=True)
             if tigs is None:
-                # annotate as NC: no contigs
-                readset.write_reads(args.unused_phased, add="IF:NC")
+                # No contig was made, so dump this readset in the
+                # unused_phased file. First, add a keyval that
+                # indicates this.
+                readset.add_keyval(IF="NC")
+                readset.write(args.unused_phased)
                 return 
             root_name = readset.name
             tigs = fermi.fastq_to_list(tigs, root_name)
             for tig in tigs:
                 args.contigs.write("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
+
 
     def mp_assembly_callback(phased_readset, unused_readset):
         """
@@ -420,10 +398,10 @@ def output_main(args):
     
     def writer_callback(phased_readset, unused_readset):
         if args.phased is not None:
-            phased_readset[0].write_reads(args.phased)
-            phased_readset[1].write_reads(args.phased)
+            phased_readset[0].write(args.phased)
+            phased_readset[1].write(args.phased)
         if args.unused_phased is not None:
-            unused_readset.write_reads(args.unused_phased)
+            unused_readset.write(args.unused_phased)
 
     phase_reads(args.bam, args.hapcut, args.unphased, args.mapq,
                 args.exclude_duplicates, writer_callback,
