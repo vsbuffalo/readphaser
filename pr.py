@@ -221,12 +221,16 @@ def group_reads_by_block(reads, block, block_id, callback):
                 inconsistent_minor_htype[pos] += 1
             unused_readset.add_readpair(readpair)
             continue
+        if len(htype_pos) == 1 and htype_pos.keys()[0] is None:
+            # this read's only overlap with a variant is not a phased
+            # allele, so the key is None. Add to unused.
+            unused_readset.add_readpair(readpair)
+            continue
         assert(len(htype_pos) == 1)
         phase = htype_pos.keys()[0]
         phased_readsets[phase].add_readpair(readpair)
         
-    if callback is not None:
-        callback(phased_readsets, unused_readset)
+    callback(phased_readsets, unused_readset)
 
 
 def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicates,
@@ -262,7 +266,6 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
     for refname, phased_blocks in hapcut_dict.iteritems():
         filter_stats, filter_fun = filter_fun_factory(mapq, exclude_duplicates, exclude_indels=True)
         reads = hashreads(bamfile.fetch(reference=refname), bamfile, filter_fun)
-
         for block_id, block in enumerate(phased_blocks):
             group_reads_by_block(reads, block, block_id, callback)
     
@@ -274,7 +277,7 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
                 read.mapq < mapq or (exclude_duplicates and read.is_duplicate)):
                 continue
             which_read = 1 if read.is_read1 else 2
-            seq = read.seq
+            seq = read.query
             qual = read.qual
             if read.is_reverse:
                 seq = revcomp(seq)
@@ -314,7 +317,7 @@ def assembly_worker(phased_readsets, unused_readset, k):
             readset.add_keyval(IF="NC")
             unused_fasta_strs.extend(str(readset))
             return 
-        root_name = readset.name
+        root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
         tigs = fermi.fastq_to_list(tigs, root_name)
         for tig in tigs:
             phased_fasta_strs.append("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
@@ -356,10 +359,10 @@ def assemble_main(args):
                                    args=(output_queue, args.contigs, args.unused_phased))
         consumer_process.start()
     
-    def assembly_callback(phased_readset, unused_readset):
+    def assembly_callback(phased_readsets, unused_readset):
         if args.unused_phased is not None:
-                unused_readset.write(args.unused_phased)
-        for readset in phased_readset:
+                unused_phased.write(args.unused_phased)
+        for readset in phased_readsets:
             fermi = fm.Fermi()
             if len(readset) == 0:
                 return
@@ -368,24 +371,20 @@ def assemble_main(args):
             fermi.correct()
             tigs = fermi.assemble(unitig_k=args.k, do_clean=True)
             if tigs is None:
-                # No contig was made, so dump this readset in the
-                # unused_phased file. First, add a keyval that
-                # indicates this.
-                readset.add_keyval(IF="NC")
-                readset.write(args.unused_phased)
+                readset.write(args.unused_readset)
                 return 
-            root_name = readset.name
+            root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
             tigs = fermi.fastq_to_list(tigs, root_name)
             for tig in tigs:
                 args.contigs.write("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
 
 
-    def mp_assembly_callback(phased_readset, unused_readset):
+    def mp_assembly_callback(phased_readsets, unused_readset):
         """
         mp_assembly_callback() is multiprocessor assembly callback,
         used if the num_procs > 1.
         """
-        worker_pool.apply_async(assembly_worker, args=(phased_readset, unused_readset, args.k),
+        worker_pool.apply_async(assembly_worker, args=(phased_readsets, unused_readset, args.k),
                                 callback=output_queue.put)
     if num_procs > 1:
         callback = mp_assembly_callback
@@ -444,7 +443,8 @@ if __name__ == "__main__":
     parser_assemble.add_argument("-P", "--num-procs",
                                  help="number of processors to use",
                                  type=int, default=1)
-    parser_assemble.add_argument("-k", help="k-mer size for assembly, default: let fermi choose ", type=int, default=None)
+    parser_assemble.add_argument("-k", help="k-mer size for assembly, default: let fermi choose ",
+                                 type=int, default=-1)
 
     parser_output = subparsers.add_parser('output', help='output phased reads to file')
     parser_output.add_argument("-u", "--unphased",

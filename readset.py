@@ -29,6 +29,9 @@ class ReadSet(object):
     def add_keyval(self, **kwargs):
         self._keyvals = dict(self._keyvals.items() + kwargs.items())
 
+    def __getitem__(self, key):
+        return self._keyvals[key]
+
     @property
     def keyvals(self):
         return " ".join("%s:%s" % (k, v) for k, v in self._keyvals.items())
@@ -45,8 +48,8 @@ class ReadSet(object):
         for read in readpair:
             if read is None:
                 continue
-            seq = read.seq
-            qual = read.qual
+            seq = read.query
+            qual = read.qqual
             if read.is_reverse:
                 seq = revcomp(seq)
                 qual = qual[::-1]
