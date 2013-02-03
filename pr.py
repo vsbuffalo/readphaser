@@ -51,8 +51,8 @@ def filter_fun_factory(mapq, exclude_duplicates, exclude_indels):
             stats["unmapped"] += 1
             return False
         filters_fail = {"mapq<%d" % mapq:read.mapq < mapq,
-                        "contains_indel":exclude_indels and read.cigar is not None and has_indel(read),
-                        "contains_duplicate":exclude_duplicates and read.is_duplicate}
+                        "indels":exclude_indels and read.cigar is not None and has_indel(read),
+                        "duplicates":exclude_duplicates and read.is_duplicate}
         for k, v in filters_fail.items():
             stats[k] += v
         return not any(filters_fail.values())
@@ -80,16 +80,14 @@ def hashreads(readiter, bamfile, pass_filter_fun):
 def revcomp(seq):
     return str(Seq(seq).reverse_complement())
 
-def print_block_stats(refname, block_id, allele_counts, read_stats):
+def print_block_stats(refname, block_id, allele_counts, stats):
     """
     For each block, print allele counts and the read statistics.
     """
-    tmp = (refname, block_id, read_stats['phased'], read_stats['indel_ignore'],
-           read_stats['unused'], read_stats['inconsistent_phase'],
-           round(read_stats['max_inconsistent_ratio'], 2))
-    line_fmt = ("# contig='%s' block_id=%d num_phased=%d indel_ignore=%d "
-                "unused=%d inconsistent_phase='%s' max_inconsistent_ratio='%s'\n")
-    sys.stdout.write(line_fmt % tmp)
+    stats_str = " ".join("%s=%s" % (k, v) for k, v in stats.items())
+    line_fmt = "# contig='%s' block_id=%d " % (refname, block_id)
+    line_fmt += stats_str + "\n"
+    sys.stdout.write(line_fmt)
     sorted_counts = sorted(allele_counts.items(), key=itemgetter(0))
     for pos, counts in sorted_counts:
         joined = ";".join(["%s:%s" % (a, c) for a, c in counts.items()])
@@ -177,7 +175,7 @@ def minor_haplotype_position(htype_pos):
     minor_htype = sorted(htype_pos.items(), key=lambda x: len(x[1]))[0]
     return minor_htype[1]
     
-def group_reads_by_block(reads, block, block_id, callback):
+def group_reads_by_block(reads, block, block_id, callback, stats):
     """
     group_reads_by_block() takes a dictionary of reads by read name,
     with the values as lists of length two, of each pair (or None for
@@ -194,7 +192,6 @@ def group_reads_by_block(reads, block, block_id, callback):
     # initiate data structures and counters for this block
     phased_readsets = (ReadSet(CT=refname, BL=block_id, PH=0), ReadSet(CT=refname, BL=block_id, PH=1))
     unused_readset = ReadSet(CT=refname, BL="NA", PH="NA")
-    stats = Counter()
     allele_counts = defaultdict(Counter)
     inconsistent_minor_htype = Counter()
     
@@ -215,7 +212,7 @@ def group_reads_by_block(reads, block, block_id, callback):
             # many) we can detect it. Two variants disagreeing in
             # phase in a majority of reads don't allow us to infer
             # which is out of phase.
-            stats["inconsistent_haplotype"] += 1
+            stats["inconsistent_phase"] += 1
             minor_htype_pos = minor_haplotype_position(htype_pos)
             for pos in minor_htype_pos:
                 inconsistent_minor_htype[pos] += 1
@@ -228,8 +225,10 @@ def group_reads_by_block(reads, block, block_id, callback):
             continue
         assert(len(htype_pos) == 1)
         phase = htype_pos.keys()[0]
+        stats['phased'] += 1
         phased_readsets[phase].add_readpair(readpair)
-        
+
+    print_block_stats(refname, block_id, allele_counts, stats)
     callback(phased_readsets, unused_readset)
 
 
@@ -267,7 +266,7 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
         filter_stats, filter_fun = filter_fun_factory(mapq, exclude_duplicates, exclude_indels=True)
         reads = hashreads(bamfile.fetch(reference=refname), bamfile, filter_fun)
         for block_id, block in enumerate(phased_blocks):
-            group_reads_by_block(reads, block, block_id, callback)
+            group_reads_by_block(reads, block, block_id, callback, filter_stats)
     
     # handle unphased contigs
     if unphased_file is not None:
