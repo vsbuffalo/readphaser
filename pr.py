@@ -13,6 +13,8 @@ Notes:
 TODO:
  - check total read counts
  - check allele counts
+ - reads from same ref, but different blocks - handled?
+ - readsets at block level could be wrong.
 """
 TEST = True
 import pdb
@@ -28,61 +30,52 @@ from hapcut import HapCut
 import fermi as fm
 from readset import ReadSet
 
-class ContainsIndel(Exception):
-    """
-    ContainsIndels is a simple Exception for reads that contain
-    indels.
-    """
-    def __init__(self, read):
-        self.read = read
-        self.name = "indel"
-
-class NoOverlap(Exception):
-    """
-    NoOverlap is a simple Exception for reads with no overlap with a
-    phased variant.
-    """
-    def __init__(self, read):
-        self.read = read
-        self.name = "no-overlap"
-
-class UnphasedVariant(Exception):
-    """
-    UnphasedVariant is a simple Exception for reads that contain an
-    allele that is unphased at a phased loci.
-    """
-    def __init__(self, read):
-        self.read = read
-        self.name = "unphased"
+### Read-level Exceptions ###
+#
+# These cleanup the core calls to count_read_haplotypes() by allow
+# exceptions to be raised and handled at higher levels (rather than
+# through ugly return values).
 
 def has_indel(read):
     return any([op in (1, 2) for op, _ in read.cigar])
 
-def getmate_factory(refname, bamfile):
+def filter_fun_factory(mapq, exclude_duplicates, exclude_indels):
     """
-    Hash all reads from a refname and return a function that grabs the
-    mate given a read name and which read is currently being handled.
+    Make a closure around some filtering options. This returns a tuple
+    of a counter, and the filtering closure. Side-effects of the
+    counter occur while filter occurs.
+    """
+    stats = Counter()
+    def read_passes_fun(read):
+        if read.is_unmapped:
+            stats["unmapped"] += 1
+            return False
+        filters_fail = {"mapq<%d" % mapq:read.mapq < mapq,
+                        "contains_indel":exclude_indels and read.cigar is not None and has_indel(read),
+                        "contains_duplicate":exclude_duplicates and read.is_duplicate}
+        for k, v in filters_fail.items():
+            stats[k] += v
+        return not any(filters_fail.values())
+    return stats, read_passes_fun
 
-    Note that we explicitly do not handle KeyErrors here; this is
-    intentional; if a KeyError occurs it means the mate is not mapped,
-    or is mapped to a different contig (improper pair), which should
-    be handled elsewhere.
+def hashreads(readiter, bamfile, pass_filter_fun):
     """
-    reads = defaultdict(dict)
-    for read in bamfile.fetch(reference=refname):
+    Reads are processed at the fragment level (both reads in the
+    pair). This hashes them all first for quicker access, as seeking
+    via file (via pysam.Samfile.getmate()) is very slow. filter_fun()
+    is a function used for filtering, should return True if a read
+    passes a filter.
+
+    Because this fetches my reference, proper-pairs (based on common
+    reference mapping, not insert size) are only here.
+    """
+    reads = defaultdict(lambda: [None, None])
+    for read in readiter:
+        if not pass_filter_fun(read):
+            continue
         which_read = 0 if read.is_read1 else 1
         reads[read.qname][which_read] = read
-
-    def getter(read):
-        which_read = 0 if read.is_read1 else 1
-        assert(not read.is_unmapped)
-        usable_mate = not read.mate_is_unmapped and read.rnext == read.tid
-        if not usable_mate:
-            return None
-        which = (1, 0)
-        return reads[read.qname][which[which_read]]
-
-    return getter
+    return reads
 
 def revcomp(seq):
     return str(Seq(seq).reverse_complement())
@@ -91,23 +84,17 @@ def print_block_stats(refname, block_id, allele_counts, read_stats):
     """
     For each block, print allele counts and the read statistics.
     """
-    tmp = (refname, block_id, read_stats['phased'], read_stats['indel_ignore'], read_stats['unused'])
-    sys.stdout.write("# contig='%s' block_id=%d num_phased=%d indel_ignore=%d unused=%d\n" % tmp)
+    tmp = (refname, block_id, read_stats['phased'], read_stats['indel_ignore'],
+           read_stats['unused'], read_stats['inconsistent_phase'],
+           round(read_stats['max_inconsistent_ratio'], 2))
+    line_fmt = ("# contig='%s' block_id=%d num_phased=%d indel_ignore=%d "
+                "unused=%d inconsistent_phase='%s' max_inconsistent_ratio='%s'\n")
+    sys.stdout.write(line_fmt % tmp)
     sorted_counts = sorted(allele_counts.items(), key=itemgetter(0))
     for pos, counts in sorted_counts:
         joined = ";".join(["%s:%s" % (a, c) for a, c in counts.items()])
         sys.stdout.write("%s\t%d\t%d\t%s\n" % (refname, block_id, pos, joined))
     sys.stdout.flush()
-
-def pass_filters(read, mapq=0, exclude_duplicates=False):
-    """
-    Function for filtering reads, primarily for clarity. Read must be
-    mapped, and have sufficient quality and not be a duplicate,
-    depending on args.
-    """
-    if exclude_duplicates and read.is_duplicate:
-        return False
-    return (not read.is_unmapped) and read.mapq >= mapq
 
 def get_block_haplotypes(block):
     """
@@ -126,59 +113,76 @@ def get_block_haplotypes(block):
         haplotypes[allele_tup] = dict([ref_key, var_key])
     return haplotypes
 
-def count_read_haplotypes(read, haplotypes):
+def group_varpos_by_haplotype(readpair, haplotypes, allele_counts):
     """
-    Given an AlignedRead and a haplotype dictionary from
-    get_block_haplotypes(), this raises an Exception for unhandled
-    cases, or returns a Counter object the the haplotype counts in a
-    read. 
+    Given a readpair tuple (entire paired fragment), compare each
+    variant position from the HapCut haplotype data to the variant
+    present in the read. Variant interval tuples will be grouped into
+    a list per haplotype; both haplotypes are stored in dictionary
+    with keys as [0, 1, None]. None indicates that the read contained
+    an variant at the position that was not phased, either due to
+    sequencing or mapping error, triallelic variant. Indel-containing
+    reads are not phased.
+
+    Not that read pairs *could* overlap, and one could have a
+    sequencing error at this same position, so the same interval could
+    be in two haplotype lists.
     """
-    # For each read, we want to assess whether it is consistent
-    # across a set of variants that span it. This is done by using
-    # a counter of phased variants.
-    htypes_counts = Counter()
-
-    for key, alleles in haplotypes.items():
-        # alleles is dict of allele:phase
-        interval = key[0:2]
-        allele_len = key[2]
-        if read.overlap(interval[0], interval[1]) == allele_len:
-            # full overlap of variant - necessary for multibase variants
-
-            # check for indel, which will break our variant
-            # retrieval.
-            if has_indel(read):
-                raise ContainsIndel(read)
-            else:
-                # no indel; can safely grab variant with position offet
+    htypes_pos = defaultdict(list)
+    for read in readpair:
+        if read is None:
+            continue
+        assert(not has_indel(read))
+        for key, alleles in haplotypes.items():
+            # alleles is dict of allele:phase
+            interval = key[0:2]
+            allele_len = key[2]
+            if read.overlap(interval[0], interval[1]) == allele_len:
                 read_var = read.query[interval[0]-read.pos:interval[1]-read.pos]
                 htype = alleles.get(read_var, None)
-                if htype is None:
-                    raise UnphasedVariant(read)
-                htypes_counts[htype] += 1
+                allele_counts[interval[0]][read_var] += 1
+                htypes_pos[htype].append(interval)
+    return htypes_pos
 
-    if len(htypes_counts) == 0:
-        raise NoOverlap(read)
-    
-    return htypes_counts
-
-    
-def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, getmate, callback=None):
+def has_inconsistent_overlap(htype_pos):
     """
-    Take a HapCut hapcut.Block (a single phased block) and a BAM file
-    and group the BAM file's reads by phased variants.
+    Given haplotype position lists, return boolean whether haplotype
+    has read pairs that overlap (isize < 0), and have two different
+    alleles at a position (which must be due to error).
+    """
+    all_intervals = list()
+    for intervals in htype_pos.values():
+        all_intervals.extend(list(set(intervals)))
+    return any(map(lambda x: x > 1, Counter(all_intervals).values()))
 
-    Arguments
-     - block: a phased Block named tuple
-     - block_id: string indicating block id [0, n]
-     - bamfike: an open bamfile from pysam
-     - mapq: threshold mapping quality
-     - exclude_duplicates: exclude reads that have an optical duplicate FLAG
-     - getmate: a closure created by getmate_factory() that wraps mate data
-     - callback: a callback function that takes the phased_readset list and the unused_readset 
 
-    Intervals are 0-indexed. HapCut is 1-indexed (thus,
-    entry.position-1).
+def is_inconsistent_read(htype_pos):
+    """
+    Given haplotype positions list, return whether haplotype is
+    inconsistent.
+    """
+    return len(set(htype_pos.keys())) > 1
+
+def minor_haplotype_position(htype_pos):
+    """
+    Return the position of the the least abundant haplotype in a read
+    with inconsistent haplotypes.
+
+    Note: this does not handle ties, which could occur if two variants
+    are out of phase and have reads cross them. Since there are only
+    two, it is impossible to indentify which is out of phase.
+    """
+    assert(not has_inconsistent_overlap(htype_pos))
+    assert(is_inconsistent_read(htype_pos))
+    minor_htype = sorted(htype_pos.items(), key=lambda x: len(x[1]))[0]
+    return minor_htype[1]
+    
+def group_reads_by_block(reads, block, block_id, callback):
+    """
+    group_reads_by_block() takes a dictionary of reads by read name,
+    with the values as lists of length two, of each pair (or None for
+    missing). It also takes a HapCut.Block (a single phased block) and
+    group's the reads by phased variants.
     """
     refname = block.entries[0].chromosome
     sys.stderr.write("[phase_reads] phasing '%s', block_id %d\n" % (refname, block_id))
@@ -188,33 +192,42 @@ def group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates, get
     haplotypes = get_block_haplotypes(block)
 
     # initiate data structures and counters for this block
-    readsets = (ReadSet(CT=refname, BL=block_id, PH=0), ReadSet(CT=refname, BL=block_id, PH=1))
-    unused_phased = ReadSet(CT=refname, BL="NA", PH="NA")
+    phased_readsets = (ReadSet(CT=refname, BL=block_id, PH=0), ReadSet(CT=refname, BL=block_id, PH=1))
+    unused_readset = ReadSet(CT=refname, BL="NA", PH="NA")
     stats = Counter()
     allele_counts = defaultdict(Counter)
+    inconsistent_minor_htype = Counter()
     
-    for read in bamfile.fetch(refname):
-        # if False or not pass_filters(read, mapq, exclude_duplicates):
-        #     stats['filtered'] += 1
-        #     unused_phased.add_read(read)
-        #     continue
-
-        try:
-            htype_counts = count_read_haplotypes(read, haplotypes)
-        except (ContainsIndel, NoOverlap, UnphasedVariant) as e:
-            # exceptions used for clarity in logging
-            unused_phased.add_read(e.read)
-            stats[e.name] += 1
+    for qname, readpair in reads.items():
+        htype_pos = group_varpos_by_haplotype(readpair, haplotypes, allele_counts)
+        if not len(htype_pos):
+            # this read doesn't overlap a variant
             continue
-
+        if has_inconsistent_overlap(htype_pos):
+            stats["inconsistent_overlap"] += 1
+            unused_readset.add_readpair(readpair)
+            continue
+        if not has_inconsistent_overlap(htype_pos) and is_inconsistent_read(htype_pos):
+            # Grab most common out of phase allele. Our power here is
+            # greatly linked to how many close variants we have: if we
+            # have 5 variants in a fragement that are in phase, and 1
+            # out of phase (and this same out of phase is the same in
+            # many) we can detect it. Two variants disagreeing in
+            # phase in a majority of reads don't allow us to infer
+            # which is out of phase.
+            stats["inconsistent_haplotype"] += 1
+            minor_htype_pos = minor_haplotype_position(htype_pos)
+            for pos in minor_htype_pos:
+                inconsistent_minor_htype[pos] += 1
+            unused_readset.add_readpair(readpair)
+            continue
+        assert(len(htype_pos) == 1)
+        phase = htype_pos.keys()[0]
+        phased_readsets[phase].add_readpair(readpair)
         
-        
-    print stats
-
-    print_block_stats(refname, block_id, allele_counts, stats)
-    # TODO how to handle mates for phased and unphased
     if callback is not None:
-        callback(readsets, unused_phased)
+        callback(phased_readsets, unused_readset)
+
 
 def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicates,
                 callback, region=None):
@@ -244,13 +257,14 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
     hapcut_dict = HapCut(hapcut_file).to_dict()
 
     if region is not None:
-        hapcut_dict = dict([(region, hapcut_dict[region])])
+        hapcut_dict = dict([(region, hapcut_dict[repgion])])
 
     for refname, phased_blocks in hapcut_dict.iteritems():
-        getmate = getmate_factory(refname, bamfile)
+        filter_stats, filter_fun = filter_fun_factory(mapq, exclude_duplicates, exclude_indels=True)
+        reads = hashreads(bamfile.fetch(reference=refname), bamfile, filter_fun)
+
         for block_id, block in enumerate(phased_blocks):
-            group_reads_by_block(block, block_id, bamfile, mapq, exclude_duplicates,
-                                 getmate, callback)
+            group_reads_by_block(reads, block, block_id, callback)
     
     # handle unphased contigs
     if unphased_file is not None:
