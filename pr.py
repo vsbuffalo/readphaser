@@ -53,8 +53,12 @@ def filter_fun_factory(mapq, exclude_duplicates, exclude_indels):
         filters_fail = {"mapq<%d" % mapq:read.mapq < mapq,
                         "indels":exclude_indels and read.cigar is not None and has_indel(read),
                         "duplicates":exclude_duplicates and read.is_duplicate}
+        failed = False
         for k, v in filters_fail.items():
+            failed = failed or v
             stats[k] += v
+        stats["filtered"] += failed
+            
         return not any(filters_fail.values())
     return stats, read_passes_fun
 
@@ -233,7 +237,9 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
         phased_readsets[phase].add_readpair(readpair)
 
     try:
-        processed = dict((k, stats[k]) for k in stats if k is not "total")
+        sumkeys = ("filtered", "unmapped", "phased", "unphased_allele",
+                   "inconsistent_phase", "no_overlap", "inconsistent_overlap")
+        processed = dict((k, stats[k]) for k in sumkeys)
         assert(stats["total"] == sum(processed.values()))
     except AssertionError:
         pdb.set_trace()
