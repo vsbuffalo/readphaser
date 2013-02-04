@@ -11,10 +11,9 @@ Notes:
    reads.
 
 TODO:
- - check total read counts
- - check allele counts
- - reads from same ref, but different blocks - handled?
- - readsets at block level could be wrong.
+ - reads shared across blocks
+ - read accounting
+ - checking that mates are not needlessly thrown away
 """
 TEST = True
 import pdb
@@ -47,6 +46,7 @@ def filter_fun_factory(mapq, exclude_duplicates, exclude_indels):
     """
     stats = Counter()
     def read_passes_fun(read):
+        stats["total"] += 1
         if read.is_unmapped:
             stats["unmapped"] += 1
             return False
@@ -88,6 +88,7 @@ def print_block_stats(refname, block_id, allele_counts, stats):
     line_fmt = "# contig='%s' block_id=%d " % (refname, block_id)
     line_fmt += stats_str + "\n"
     sys.stdout.write(line_fmt)
+    # we sort so keys are consistently ordered
     sorted_counts = sorted(allele_counts.items(), key=itemgetter(0))
     for pos, counts in sorted_counts:
         joined = ";".join(["%s:%s" % (a, c) for a, c in counts.items()])
@@ -196,12 +197,14 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
     inconsistent_minor_htype = Counter()
     
     for qname, readpair in reads.items():
+        numreads = sum(int(r is not None) for r in readpair)
         htype_pos = group_varpos_by_haplotype(readpair, haplotypes, allele_counts)
         if not len(htype_pos):
+            stats["no_overlap"] += numreads
             # this read doesn't overlap a variant
             continue
         if has_inconsistent_overlap(htype_pos):
-            stats["inconsistent_overlap"] += 1
+            stats["inconsistent_overlap"] += numreads
             unused_readset.add_readpair(readpair)
             continue
         if not has_inconsistent_overlap(htype_pos) and is_inconsistent_read(htype_pos):
@@ -212,7 +215,7 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
             # many) we can detect it. Two variants disagreeing in
             # phase in a majority of reads don't allow us to infer
             # which is out of phase.
-            stats["inconsistent_phase"] += 1
+            stats["inconsistent_phase"] += numreads
             minor_htype_pos = minor_haplotype_position(htype_pos)
             for pos in minor_htype_pos:
                 inconsistent_minor_htype[pos] += 1
@@ -221,13 +224,19 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
         if len(htype_pos) == 1 and htype_pos.keys()[0] is None:
             # this read's only overlap with a variant is not a phased
             # allele, so the key is None. Add to unused.
+            stats["unphased_allele"] += numreads
             unused_readset.add_readpair(readpair)
             continue
         assert(len(htype_pos) == 1)
         phase = htype_pos.keys()[0]
-        stats['phased'] += 1
+        stats['phased'] += numreads
         phased_readsets[phase].add_readpair(readpair)
 
+    try:
+        processed = dict((k, stats[k]) for k in stats if k is not "total")
+        assert(stats["total"] == sum(processed.values()))
+    except AssertionError:
+        pdb.set_trace()
     print_block_stats(refname, block_id, allele_counts, stats)
     callback(phased_readsets, unused_readset)
 
@@ -301,26 +310,31 @@ def assembly_worker(phased_readsets, unused_readset, k):
     readset are added to unused with the additional key:value of IF:NC
     for InFo: No Contigs.
     """
-    phased_fasta_strs = list()
-    unused_fasta_strs = unused_readset.str_reads()
-    for readset in phased_readsets:
-        fermi = fm.Fermi()
-        if len(readset) == 0:
-            return
-        for seq, qual in readset:
-            fermi.addseq(seq, qual)
-        fermi.correct()
-        tigs = fermi.assemble(unitig_k=k, do_clean=True)
-        if tigs is None:
-            # annotate as NC: no contigs
-            readset.add_keyval(IF="NC")
-            unused_fasta_strs.extend(str(readset))
-            return 
-        root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
-        tigs = fermi.fastq_to_list(tigs, root_name)
-        for tig in tigs:
-            phased_fasta_strs.append("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
-    return (phased_fasta_strs, unused_fasta_strs)
+    try:
+        phased_fasta_strs = list()
+        unused_fasta_strs = [str(unused_readset)] # initial block as string
+        for readset in phased_readsets:
+            fermi = fm.Fermi()
+            if len(readset) == 0:
+                return
+            for seq, qual in readset:
+                fermi.addseq(seq, qual)
+            fermi.correct()
+            tigs = fermi.assemble(unitig_k=k, do_clean=True)
+            if tigs is None:
+                unused_fasta_strs.append(str(readset))
+                return 
+            root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
+            tigs = fermi.fastq_to_list(tigs, root_name)
+            for tig in tigs:
+                phased_fasta_strs.append("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
+        return (phased_fasta_strs, unused_fasta_strs)
+    except:
+        # assembly_worker() runs in another process, and this is very
+        # hard to debug. This is to catch *any* exception, and error
+        # out excplicitly.
+        sys.stderr.write("[error] uncaught exception in assembly_worker() subprocess:\n")
+        print sys.exc_info()[0]
 
 def consume_and_write(queue, contig_file, unused_file):
     """
@@ -370,7 +384,7 @@ def assemble_main(args):
             fermi.correct()
             tigs = fermi.assemble(unitig_k=args.k, do_clean=True)
             if tigs is None:
-                readset.write(args.unused_readset)
+                readset.write(args.unused_readset) # TODO BAD
                 return 
             root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
             tigs = fermi.fastq_to_list(tigs, root_name)

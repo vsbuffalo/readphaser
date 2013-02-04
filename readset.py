@@ -75,8 +75,9 @@ class ReadSet(object):
                     continue
                 which = i + 1
                 header = "%s-%s %s" % (qname, which, self.keyvals)
-                out.append("@%s\n%s\n+\n%s\n" % (header, read.seq, read.qual))
-        return out
+                entry = "@%s\n%s\n+\n%s\n" % (header, read.seq, read.qual)
+                out.append(entry)
+        return "\n".join(out)
                 
     def write(self, file_handle):
         """
