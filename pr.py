@@ -199,6 +199,7 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
     unused_readset = ReadSet(CT=refname, BL="NA", PH="NA")
     allele_counts = defaultdict(Counter)
     inconsistent_minor_htype = Counter()
+    block_stats = Counter()
     
     for qname, readpair in reads.items():
         # number of reads in this readpair/fragment - necessary for read accounting
@@ -206,11 +207,11 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
         
         htype_pos = group_varpos_by_haplotype(readpair, haplotypes, allele_counts)
         if not len(htype_pos):
-            stats["no_overlap"] += numreads
+            block_stats["no_overlap"] += numreads
             # this read doesn't overlap a variant
             continue
         if has_inconsistent_overlap(htype_pos):
-            stats["inconsistent_overlap"] += numreads
+            block_stats["inconsistent_overlap"] += numreads
             unused_readset.add_readpair(readpair)
             continue
         if not has_inconsistent_overlap(htype_pos) and is_inconsistent_read(htype_pos):
@@ -221,7 +222,7 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
             # many) we can detect it. Two variants disagreeing in
             # phase in a majority of reads don't allow us to infer
             # which is out of phase.
-            stats["inconsistent_phase"] += numreads
+            block_stats["inconsistent_phase"] += numreads
             minor_htype_pos = minor_haplotype_position(htype_pos)
             for pos in minor_htype_pos:
                 inconsistent_minor_htype[pos] += 1
@@ -230,12 +231,12 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
         if len(htype_pos) == 1 and htype_pos.keys()[0] is None:
             # this read's only overlap with a variant is not a phased
             # allele, so the key is None. Add to unused.
-            stats["unphased_allele"] += numreads
+            block_stats["unphased_allele"] += numreads
             unused_readset.add_readpair(readpair)
             continue
         assert(len(htype_pos) == 1)
         phase = htype_pos.keys()[0]
-        stats['phased'] += numreads
+        block_stats['phased'] += numreads
         phased_readsets[phase].add_readpair(readpair)
 
     try:
@@ -243,7 +244,8 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
         # different reasons.
         sumkeys = ("filtered", "unmapped", "phased", "unphased_allele",
                    "inconsistent_phase", "no_overlap", "inconsistent_overlap")
-        processed = dict((k, stats[k]) for k in sumkeys)
+        all_stats = block_stats + stats
+        processed = dict((k, all_stats[k]) for k in sumkeys)
         assert(stats["total"] == sum(processed.values()))
     except AssertionError:
         pdb.set_trace()
