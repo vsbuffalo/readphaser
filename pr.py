@@ -180,7 +180,7 @@ def minor_haplotype_position(htype_pos):
     minor_htype = sorted(htype_pos.items(), key=lambda x: len(x[1]))[0]
     return minor_htype[1]
     
-def group_reads_by_block(reads, block, block_id, callback, stats):
+def group_reads_by_block(reads, block, block_id, callback, stats, inconsistent_counts_file=None):
     """
     group_reads_by_block() takes a dictionary of reads by read name,
     with the values as lists of length two, of each pair (or None for
@@ -250,12 +250,15 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
     except AssertionError:
         pdb.set_trace()
 
+    if inconsistent_counts_file is not None:
+        for pos, count in inconsistent_minor_htype.items():
+            inconsistent_counts_file.write("\t".join(map(str, (refname, block_id, pos, count))) + "\n")
     print_block_stats(refname, block_id, allele_counts, stats)
     callback(phased_readsets, unused_readset)
 
 
-def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicates,
-                callback, region=None):
+def phase_reads(bam_filename, hapcut_file, unphased_file, inconsistent_counts_file,
+                mapq, exclude_duplicates, callback, region=None):
     """
     phase_reads() is the primary function that dispatches
     group_reads_by_block() per block. Given a BAM filebame, HapCut
@@ -288,7 +291,7 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
         stats, filter_fun = filter_fun_factory(mapq, exclude_duplicates, exclude_indels=True)
         reads = hashreads(bamfile.fetch(reference=refname), bamfile, filter_fun)
         for block_id, block in enumerate(phased_blocks):
-            group_reads_by_block(reads, block, block_id, callback, stats)
+            group_reads_by_block(reads, block, block_id, callback, stats, inconsistent_counts_file)
 
     # handle unphased contigs
     if unphased_file is not None:
@@ -360,7 +363,10 @@ def consume_and_write(queue, contig_file, unused_file):
     file handle.
     """
     while True:
-        val = queue.get()
+        try:
+            val = queue.get()
+        except Queue.Empty:
+            continue
         if val is None:
             break
         for outfile, results in zip([contig_file, unused_file], val):
@@ -417,8 +423,8 @@ def assemble_main(args):
     else:
         callback = assembly_callback
 
-    phase_reads(args.bam, args.hapcut, args.unphased, args.mapq,
-                args.exclude_duplicates, callback=callback,
+    phase_reads(args.bam, args.hapcut, args.unphased, args.inconsistent_counts,
+                args.mapq, args.exclude_duplicates, callback=callback,
                 region=args.region)
 
     if num_procs > 1:
@@ -442,8 +448,8 @@ def output_main(args):
         if args.unused_phased is not None:
             unused_readset.write(args.unused_phased)
 
-    phase_reads(args.bam, args.hapcut, args.unphased, args.mapq,
-                args.exclude_duplicates, writer_callback,
+    phase_reads(args.bam, args.hapcut, args.unphased, args.inconsistent_counts,
+                args.mapq, args.exclude_duplicates, writer_callback,
                 region=args.region)
 
 if __name__ == "__main__":
@@ -466,6 +472,9 @@ if __name__ == "__main__":
     parser_assemble.add_argument("-u", "--unphased",
                                  help="FASTA filename for reads from unphased contigs",
                                  type=argparse.FileType('w'), default=None)
+    parser_assemble.add_argument("-i", "--inconsistent-counts",
+                                 help="file to write contigs with inconsistently phased alleles (tab format)",
+                                 type=argparse.FileType('w'), default=None, required=False)    
     parser_assemble.add_argument("-P", "--num-procs",
                                  help="number of processors to use",
                                  type=int, default=1)
@@ -483,6 +492,9 @@ if __name__ == "__main__":
                                help="FASTA filename for reads from phased "
                                "contigs unused during phasing",
                                type=argparse.FileType('w'), default=None)
+    parser_output.add_argument("-i", "--inconsistent-counts",
+                               help="file to write contigs with inconsistently phased alleles (tab format)",
+                               type=argparse.FileType('w'), default=None, required=False)    
     parser_output.add_argument("-m", "--mapq",
                                help="mapping quality threshold (exclude if below)", 
                                type=int, required=False, default=0)
