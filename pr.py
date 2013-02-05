@@ -238,6 +238,16 @@ def group_reads_by_block(reads, block, block_id, callback, stats):
         stats['phased'] += numreads
         phased_readsets[phase].add_readpair(readpair)
 
+    try:
+        # here, we keep track of our total reads in and out, for
+        # different reasons.
+        sumkeys = ("filtered", "unmapped", "phased", "unphased_allele",
+                   "inconsistent_phase", "no_overlap", "inconsistent_overlap")
+        processed = dict((k, stats[k]) for k in sumkeys)
+        assert(stats["total"] == sum(processed.values()))
+    except AssertionError:
+        pdb.set_trace()
+
     print_block_stats(refname, block_id, allele_counts, stats)
     callback(phased_readsets, unused_readset)
 
@@ -270,23 +280,13 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, mapq, exclude_duplicat
     hapcut_dict = HapCut(hapcut_file).to_dict()
 
     if region is not None:
-        hapcut_dict = dict([(region, hapcut_dict[repgion])])
+        hapcut_dict = dict([(region, hapcut_dict[region])])
 
     for refname, phased_blocks in hapcut_dict.iteritems():
         stats, filter_fun = filter_fun_factory(mapq, exclude_duplicates, exclude_indels=True)
         reads = hashreads(bamfile.fetch(reference=refname), bamfile, filter_fun)
         for block_id, block in enumerate(phased_blocks):
             group_reads_by_block(reads, block, block_id, callback, stats)
-
-        try:
-            # here, we keep track of our total reads in and out, for
-            # different reasons.
-            sumkeys = ("filtered", "unmapped", "phased", "unphased_allele",
-                       "inconsistent_phase", "no_overlap", "inconsistent_overlap")
-            processed = dict((k, stats[k]) for k in sumkeys)
-            assert(stats["total"] == sum(processed.values()))
-        except AssertionError:
-            pdb.set_trace()
 
     # handle unphased contigs
     if unphased_file is not None:
