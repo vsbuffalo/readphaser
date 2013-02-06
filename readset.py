@@ -35,6 +35,27 @@ class ReadSet(object):
     @property
     def keyvals(self):
         return " ".join("%s:%s" % (k, v) for k, v in self._keyvals.items())
+
+    def join(self, other_readset):
+        """
+        Join two readsets.
+        """
+        for qname, readpair in other_readset.readset.items():
+            value = self.readset.get(qname, None)
+            if value is None:
+                self.readset[qname] = readpair
+            elif None in value:
+                # merge the two
+                for which_read in (0, 1):
+                    if self.readset[qname][which_read] is not None:
+                        if other_readset[qname][which_read] is not None:
+                            assert(other_readset[qname][which_read].seq == self.readset[qname][which_read].seq)
+                            assert(other_readset[qname][which_read].qual == self.readset[qname][which_read].qual)
+                    else:
+                        if other_readset[qname][which_read] is not None:
+                            self.readset[qname][which_read] = other_readset[qname][which_read]
+            else:
+                pass # no merging to be done
     
     def add_readpair(self, readpair):
         """
@@ -75,9 +96,9 @@ class ReadSet(object):
                     continue
                 which = i + 1
                 header = "%s-%s %s" % (qname, which, self.keyvals)
-                entry = "@%s\n%s\n+\n%s\n" % (header, read.seq, read.qual)
+                entry = "@%s\n%s\n+\n%s" % (header, read.seq, read.qual)
                 out.append(entry)
-        return "\n".join(out)
+        return "\n".join(out) + "\n"
                 
     def write(self, file_handle):
         """

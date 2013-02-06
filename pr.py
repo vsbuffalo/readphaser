@@ -17,9 +17,9 @@ TODO:
 """
 TEST = True
 import pdb
+import time
 import sys
 from multiprocessing import Queue, Pool, Process
-from Queue import Empty
 import argparse
 from collections import defaultdict, OrderedDict, Counter
 from operator import itemgetter
@@ -293,23 +293,23 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, inconsistent_counts_fi
         for block_id, block in enumerate(phased_blocks):
             group_reads_by_block(reads, block, block_id, callback, stats, inconsistent_counts_file)
 
-    # handle unphased contigs
-    if unphased_file is not None:
-        unphased_contigs = set(bamfile.references) - set(hapcut_dict.keys())
-        for read in bamfile:
-            if (read not in unphased_contigs or read.is_unmapped or
-                read.mapq < mapq or (exclude_duplicates and read.is_duplicate)):
-                continue
-            which_read = 1 if read.is_read1 else 2
-            seq = read.query
-            qual = read.qual
-            if read.is_reverse:
-                seq = revcomp(seq)
-                qual = qual[::-1]
-            fields = map(str, (read.qname, which_read, bamfile.getrname[read.tid]))
-            # NP: not phased
-            header = "%s-%s CT:NP BL:NP PH:NP" % tuple(fields)
-            unphased_file.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
+    # # handle unphased contigs
+    # if unphased_file is not None:
+    #     unphased_contigs = set(bamfile.references) - set(hapcut_dict.keys())
+    #     for read in bamfile:
+    #         if (read not in unphased_contigs or read.is_unmapped or
+    #             read.mapq < mapq or (exclude_duplicates and read.is_duplicate)):
+    #             continue
+    #         which_read = 1 if read.is_read1 else 2
+    #         seq = read.query
+    #         qual = read.qual
+    #         if read.is_reverse:
+    #             seq = revcomp(seq)
+    #             qual = qual[::-1]
+    #         fields = map(str, (read.qname, which_read, bamfile.getrname[read.tid]))
+    #         # NP: not phased
+    #         header = "%s-%s CT:NP BL:NP PH:NP" % tuple(fields)
+    #         unphased_file.write("@%s\n%s\n+\n%s\n" % (header, seq[0], seq[1]))
 
 def assembly_worker(phased_readsets, unused_readset, k):
     """
@@ -362,19 +362,28 @@ def consume_and_write(queue, contig_file, unused_file):
     should only be done by once process, interacting with a single
     file handle.
     """
-    while True:
-        try:
-            val = queue.get()
-        except Queue.Empty:
-            continue
-        if val is None:
-            break
-        for outfile, results in zip([contig_file, unused_file], val):
-            if outfile is None:
-                continue # user wishes not to output this info
-            for result in results:
-                if len(result) > 0:
-                    outfile.write(result)
+    try:
+        while True:
+            try:
+                val = queue.get()
+                continue
+            except Queue.Empty:
+                continue
+            if val is "stop":
+                return
+
+            print "--------------------->"
+            
+            for outfile, results in zip([contig_file, unused_file], val):
+                if outfile is None:
+                    continue # user wishes not to output this info
+                for result in results:
+                    if len(result) > 0:
+                        print 
+                        outfile.write(result)
+    except:
+        sys.stderr.write("[error] uncaught exception in consume_and_write() subprocess:\n")
+        print sys.exc_info()[0]
         
 def assemble_main(args):
     """
@@ -387,13 +396,14 @@ def assemble_main(args):
         sys.stderr.write("[phase_reads] opening %d threads...\n" % num_procs)
         worker_pool = Pool(num_procs)
         output_queue = Queue()
-        consumer_process = Process(target=consume_and_write,
-                                   args=(output_queue, args.contigs, args.unused_phased))
-        consumer_process.start()
+        # consumer_process = Process(target=consume_and_write,
+        #                            args=(output_queue, args.contigs, args.unused_phased))
+        # consumer_process.daemon = True
+        # consumer_process.start()
+
+    output = list()
     
     def assembly_callback(phased_readsets, unused_readset):
-        if args.unused_phased is not None:
-                unused_phased.write(args.unused_phased)
         for readset in phased_readsets:
             fermi = fm.Fermi()
             if len(readset) == 0:
@@ -403,21 +413,25 @@ def assemble_main(args):
             fermi.correct()
             tigs = fermi.assemble(unitig_k=args.k, do_clean=True)
             if tigs is None:
-                readset.write(args.unused_readset) # TODO BAD
+                unused_readset.join(readset)
                 return 
             root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
             tigs = fermi.fastq_to_list(tigs, root_name)
             for tig in tigs:
                 args.contigs.write("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
 
+        if args.unused_phased is not None:
+            unused_phased.write(args.unused_phased)
 
     def mp_assembly_callback(phased_readsets, unused_readset):
         """
         mp_assembly_callback() is multiprocessor assembly callback,
         used if the num_procs > 1.
         """
-        worker_pool.apply_async(assembly_worker, args=(phased_readsets, unused_readset, args.k),
-                                callback=output_queue.put)
+        res = worker_pool.apply_async(assembly_worker,
+                                args=(phased_readsets, unused_readset, args.k),
+                                callback=output.append)
+
     if num_procs > 1:
         callback = mp_assembly_callback
     else:
@@ -427,14 +441,21 @@ def assemble_main(args):
                 args.mapq, args.exclude_duplicates, callback=callback,
                 region=args.region)
 
+    sys.stderr.write("[phase_reads] read phasing complete\n")
     if num_procs > 1:
         worker_pool.close()
         worker_pool.join()
-        output_queue.put(None)
-        output_queue.close()
-        consumer_process.join()
-    
 
+    for items in output:
+        if items is not None:
+            assembled_contigs, unused_reads = items
+            if args.contigs is not None:
+                for fastq_entry in assembled_contigs:
+                    args.contigs.write(fastq_entry)
+            if args.unused_phased is not None:
+                for fastq_entry in items[1]:
+                    args.unused_phased.write(fastq_entry)
+    
 def output_main(args):
     """
     main() function for outputting reads to a file. This also defines
