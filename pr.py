@@ -248,7 +248,7 @@ def group_reads_by_block(reads, block, block_id, callback, stats, inconsistent_c
         processed = dict((k, all_stats[k]) for k in sumkeys)
         assert(stats["total"] == sum(processed.values()))
     except AssertionError:
-        pdb.set_trace()
+        sys.stderr.write("[error] inconsistent totals for contig %s" % refname)
 
     if inconsistent_counts_file is not None:
         for pos, count in inconsistent_minor_htype.items():
