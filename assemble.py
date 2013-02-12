@@ -1,3 +1,4 @@
+import itertools
 import sys
 import re
 import pdb
@@ -78,7 +79,7 @@ def FASTQ_to_readlists(file_handle):
         is_first = None in (last_contig, last_block, last_phase)
         if not is_first and not all(same):
             assert(block_key not in past_blocks)
-            if len(readlist) > 1: # only block
+            if len(readlist) > 1: # not only block
                 yield readlist
                             
             #sys.stdout.write("\t") # TODO stats
@@ -111,12 +112,16 @@ if __name__ == "__main__":
     output_filehandle = open(sys.argv[3], 'w')
 
     if num_processes == 1:
-        assembly_queuer(assembly_queue, input_filehandle)
-        assembly_runner(assembly_queue, writer_queue)
-        contig_writer(writer_queue, output_filehandle)
+        readlists_gen = FASTQ_to_readlists(input_filehandle)
+        contigs_out = list()
+        contigs_out.extend(map(assembly, itertools.islice(readlists_gen, None)))
     else:    
         pool = Pool(num_processes)
-        contigs_out = pool.map(assembly, FASTQ_to_readlists(input_filehandle))
+        #contigs_out = pool.map(assembly, FASTQ_to_readlists(input_filehandle))
+        readlists_gen = FASTQ_to_readlists(input_filehandle)
+        contigs_out = list()
+        contigs_out.extend(pool.imap(assembly, itertools.islice(readlists_gen, None)))
+                
 
     for contigs in contigs_out:
         if contigs is None:
