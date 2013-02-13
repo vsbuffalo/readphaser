@@ -1,5 +1,6 @@
 import itertools
 import sys
+from datetime import datetime
 import re
 import pdb
 from time import sleep
@@ -30,18 +31,23 @@ FASTQEntry = namedtuple("FASTQEntry", ["name", "seq", "qual"])
 
 
 def assembly(readlist):
-    block = readlist.pop(0)
+    start = datetime.now().isoformat()
+    block = readlist[0]
     fermi = fm.Fermi()
-    for read in readlist:
-        fermi.addseq(read.seq, read.qual)
-    fermi.correct()
-    tigs = fermi.assemble(unitig_k=-1, do_clean=True)
+    for read in readlist[1:]:
+        name, seq, qual = read
+        fermi.addseq(seq, qual)
+    
+#    pdb.set_trace()
+    correct_out = fermi.correct()
+    tigs = fermi.assemble(unitig_k=int(-1), do_clean=True)
     if tigs is None:
         #sys.stdout.write("%s\tNA")
         return None
-    root_name = "%s" % ("-".join((block.contig[3:], block.block, block.phase)))
+    root_name = "-".join((block.contig[3:], block.block, block.phase))
     tigs = fermi.fastq_to_list(tigs, root_name)
-    sys.stdout.write("[assembly] completed contig %s\n" % "-t".join(s[3:] for s in block))
+    end = datetime.now().isoformat()
+    sys.stdout.write("[assembly] completed for %s (s: %s e: %s)\n" % (" ".join(block), start, end))
     return tigs
 
 # def assembly_runner(queue_in, queue_out):
@@ -74,9 +80,12 @@ def FASTQ_to_readlists(file_handle):
     readlist = list()
     for header, seq, qual in readfq(file_handle):
         name, block = parse_header(header)
+        is_first = None in (last_contig, last_block, last_phase)
+        if is_first:
+            readlist.append(block)
+
         block_key = "-".join((block.contig, block.block, block.phase))
         same = (last_contig == block.contig, last_block == block.block, last_phase == block.phase)
-        is_first = None in (last_contig, last_block, last_phase)
         if not is_first and not all(same):
             assert(block_key not in past_blocks)
             if len(readlist) > 1: # not only block
@@ -87,8 +96,6 @@ def FASTQ_to_readlists(file_handle):
             past_blocks.add(block_key)
             readlist = list()
             # first item of every readlist is block info
-            readlist.append(block)
-        if is_first:
             readlist.append(block)
         readlist.append(FASTQEntry(header, seq, qual))
         last_contig, last_block, last_phase = block.contig, block.block, block.phase
@@ -112,15 +119,16 @@ if __name__ == "__main__":
     output_filehandle = open(sys.argv[3], 'w')
 
     if num_processes == 1:
-        readlists_gen = FASTQ_to_readlists(input_filehandle)
         contigs_out = list()
-        contigs_out.extend(map(assembly, itertools.islice(readlists_gen, None)))
-    else:    
-        pool = Pool(num_processes)
-        #contigs_out = pool.map(assembly, FASTQ_to_readlists(input_filehandle))
-        readlists_gen = FASTQ_to_readlists(input_filehandle)
-        contigs_out = list()
-        contigs_out.extend(pool.imap(assembly, itertools.islice(readlists_gen, None)))
+    items = list(FASTQ_to_readlists(input_filehandle))
+    for readlist in items:
+        contigs_out.append(assembly(readlist))
+    # else:    
+    #     pool = Pool(num_processes)
+    #     #contigs_out = pool.map(assembly, FASTQ_to_readlists(input_filehandle))
+    #     readlists_gen = FASTQ_to_readlists(input_filehandle)
+    #     contigs_out = list()
+    #     contigs_out.extend(pool.imap(assembly, itertools.islice(readlists_gen, None)))
                 
 
     for contigs in contigs_out:
@@ -130,3 +138,7 @@ if __name__ == "__main__":
             output_filehandle.write("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
         
         
+    # readlists_gen = FASTQ_to_readlists(input_filehandle)
+    # for readslist in readlists_gen:
+    #     for block in readslist[1:]:
+    #         print "@%s\n%s\n+\n%s" % (block.name, block.seq, block.qual)

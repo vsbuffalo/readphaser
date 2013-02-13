@@ -253,7 +253,7 @@ def group_reads_by_block(reads, block, block_id, callback, stats, inconsistent_c
     if inconsistent_counts_file is not None:
         for pos, count in inconsistent_minor_htype.items():
             inconsistent_counts_file.write("\t".join(map(str, (refname, block_id, pos, count))) + "\n")
-    print_block_stats(refname, block_id, allele_counts, stats)
+    print_block_stats(refname, block_id, allele_counts, all_stats)
     callback(phased_readsets, unused_readset)
 
 
@@ -313,151 +313,6 @@ def phase_reads(bam_filename, hapcut_file, unphased_file, inconsistent_counts_fi
             header = "%s-%s CT:%s BL:NP PH:NP" % tuple(fields)
             unphased_file.write("@%s\n%s\n+\n%s\n" % (header, seq, qual))
 
-def assembly_worker(phased_readsets, unused_readset, k):
-    """
-    assembly_worker() takes a list of phased_readsets (one for each
-    haplotype, and recall that this is already at the *block* level)
-    and a unused_readset (reads that were unable to be phased).
-
-    assembly_worker() outputs a tuple of phased contig strings (in
-    FASTA format), and a FASTA string of unused
-    reads. assembly_worker() expects these to be handled via
-    consume_and_write(), but handled by a queue in the interim.
-
-    If the assembly fails to produce contigs, all reads from a phased
-    readset are added to unused with the additional key:value of IF:NC
-    for InFo: No Contigs.
-    """
-    try:
-        phased_fasta_strs = list()
-        unused_fasta_strs = [str(unused_readset)] # initial block as string
-        for readset in phased_readsets:
-            fermi = fm.Fermi()
-            if len(readset) == 0:
-                return
-            for seq, qual in readset:
-                fermi.addseq(seq, qual)
-            fermi.correct()
-            tigs = fermi.assemble(unitig_k=k, do_clean=True)
-            if tigs is None:
-                unused_fasta_strs.append(str(readset))
-                return 
-            root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
-            tigs = fermi.fastq_to_list(tigs, root_name)
-            for tig in tigs:
-                phased_fasta_strs.append("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
-        return (phased_fasta_strs, unused_fasta_strs)
-    except:
-        # assembly_worker() runs in another process, and this is very
-        # hard to debug. This is to catch *any* exception, and error
-        # out excplicitly.
-        sys.stderr.write("[error] uncaught exception in assembly_worker() subprocess:\n")
-        print sys.exc_info()[0]
-
-def consume_and_write(queue, contig_file, unused_file):
-    """
-    consume_and_write() takes tuples from a queue until it encounters
-    None (which functions as a stop token). Each tuple is from
-    assembly_worker(), which uses pyfermi to assembly reads. The
-    assembly results (contigs) are the first item, and unused reads
-    are the second item. This must not be run in parallel, as writing
-    should only be done by once process, interacting with a single
-    file handle.
-    """
-    try:
-        while True:
-            try:
-                val = queue.get()
-                continue
-            except Queue.Empty:
-                continue
-            if val is "stop":
-                return
-
-            print "--------------------->"
-            
-            for outfile, results in zip([contig_file, unused_file], val):
-                if outfile is None:
-                    continue # user wishes not to output this info
-                for result in results:
-                    if len(result) > 0:
-                        print 
-                        outfile.write(result)
-    except:
-        sys.stderr.write("[error] uncaught exception in consume_and_write() subprocess:\n")
-        print sys.exc_info()[0]
-        
-def assemble_main(args):
-    """
-    Main function for assembly with fermi. This also defines a closure
-    callback function over some of the arguments.
-    """
-    num_procs = args.num_procs
-
-    if num_procs > 1:
-        sys.stderr.write("[phase_reads] opening %d threads...\n" % num_procs)
-        worker_pool = Pool(num_procs)
-        output_queue = Queue()
-        # consumer_process = Process(target=consume_and_write,
-        #                            args=(output_queue, args.contigs, args.unused_phased))
-        # consumer_process.daemon = True
-        # consumer_process.start()
-
-    output = list()
-    
-    def assembly_callback(phased_readsets, unused_readset):
-        for readset in phased_readsets:
-            fermi = fm.Fermi()
-            if len(readset) == 0:
-                return
-            for seq, qual in readset:
-                fermi.addseq(seq, qual)
-            fermi.correct()
-            tigs = fermi.assemble(unitig_k=args.k, do_clean=True)
-            if tigs is None:
-                unused_readset.join(readset)
-                return 
-            root_name = "%s BL:%d PH:%d" % (readset["CT"], readset["BL"], readset["PH"])
-            tigs = fermi.fastq_to_list(tigs, root_name)
-            for tig in tigs:
-                args.contigs.write("@%s\n%s\n+\n%s\n" % (tig.header, tig.seq, tig.qual))
-
-        if args.unused_phased is not None:
-            unused_phased.write(args.unused_phased)
-
-    def mp_assembly_callback(phased_readsets, unused_readset):
-        """
-        mp_assembly_callback() is multiprocessor assembly callback,
-        used if the num_procs > 1.
-        """
-        res = worker_pool.apply_async(assembly_worker,
-                                args=(phased_readsets, unused_readset, args.k),
-                                callback=output.append)
-
-    if num_procs > 1:
-        callback = mp_assembly_callback
-    else:
-        callback = assembly_callback
-
-    phase_reads(args.bam, args.hapcut, args.unphased, args.inconsistent_counts,
-                args.mapq, args.exclude_duplicates, callback=callback,
-                region=args.region)
-
-    sys.stderr.write("[phase_reads] read phasing complete\n")
-    if num_procs > 1:
-        worker_pool.close()
-        worker_pool.join()
-
-    for items in output:
-        if items is not None:
-            assembled_contigs, unused_reads = items
-            if args.contigs is not None:
-                for fastq_entry in assembled_contigs:
-                    args.contigs.write(fastq_entry)
-            if args.unused_phased is not None:
-                for fastq_entry in items[1]:
-                    args.unused_phased.write(fastq_entry)
-    
 def output_main(args):
     """
     main() function for outputting reads to a file. This also defines
@@ -478,59 +333,29 @@ def output_main(args):
 if __name__ == "__main__":
     msg = "divide reads into groups, based on HapCut phasing results"
     parser = argparse.ArgumentParser(description=msg)
-    subparsers = parser.add_subparsers()
-    parser_assemble = subparsers.add_parser('assemble', help='assemble reads with fermi')
-    parser_assemble.add_argument("-m", "--mapq",
-                                 help="mapping quality threshold (exclude if below)", 
-                                 type=int, required=False, default=0)
-    parser_assemble.add_argument("-d", "--exclude-duplicates", help="exclude duplicate reads", 
-                                 action="store_true", default=True)
-    parser_assemble.add_argument("-c", "--contigs",
-                                 help="FASTA filename for assembled phasedc contigs",
-                                 type=argparse.FileType('w'), default=None)
-    parser_assemble.add_argument("-o", "--unused-phased",
-                                 help="FASTA filename for reads from phased "
-                                 "contigs unused during phasing",
-                                 type=argparse.FileType('w'), default=None)
-    parser_assemble.add_argument("-u", "--unphased",
-                                 help="FASTA filename for reads from unphased contigs",
-                                 type=argparse.FileType('w'), default=None)
-    parser_assemble.add_argument("-i", "--inconsistent-counts",
-                                 help="file to write contigs with inconsistently phased alleles (tab format)",
-                                 type=argparse.FileType('w'), default=None, required=False)    
-    parser_assemble.add_argument("-P", "--num-procs",
-                                 help="number of processors to use",
-                                 type=int, default=1)
-    parser_assemble.add_argument("-k", help="k-mer size for assembly, default: let fermi choose ",
-                                 type=int, default=-1)
-
-    parser_output = subparsers.add_parser('output', help='output phased reads to file')
-    parser_output.add_argument("-u", "--unphased",
-                               help="FASTA filename for reads from unphased contigs",
-                               type=argparse.FileType('w'), default=None, required=False)
-    parser_output.add_argument("-p", "--phased",
-                               help="FASTA filename for reads from phased contigs",
-                               type=argparse.FileType('w'), default=None)
-    parser_output.add_argument("-o", "--unused-phased",
-                               help="FASTA filename for reads from phased "
-                               "contigs unused during phasing",
-                               type=argparse.FileType('w'), default=None)
-    parser_output.add_argument("-i", "--inconsistent-counts",
-                               help="file to write contigs with inconsistently phased alleles (tab format)",
-                               type=argparse.FileType('w'), default=None, required=False)    
-    parser_output.add_argument("-m", "--mapq",
-                               help="mapping quality threshold (exclude if below)", 
-                               type=int, required=False, default=0)
-    parser_output.add_argument("-d", "--exclude-duplicates", help="exclude duplicate reads", 
-                               action="store_true", default=True)
+    parser.add_argument("-u", "--unphased",
+                        help="FASTA filename for reads from unphased contigs",
+                        type=argparse.FileType('w'), default=None, required=False)
+    parser.add_argument("-p", "--phased",
+                        help="FASTA filename for reads from phased contigs",
+                        type=argparse.FileType('w'), default=None)
+    parser.add_argument("-o", "--unused-phased",
+                        help="FASTA filename for reads from phased "
+                        "contigs unused during phasing",
+                        type=argparse.FileType('w'), default=None)
+    parser.add_argument("-i", "--inconsistent-counts",
+                        help="file to write contigs with inconsistently phased alleles (tab format)",
+                        type=argparse.FileType('w'), default=None, required=False)    
+    parser.add_argument("-m", "--mapq",
+                        help="mapping quality threshold (exclude if below)", 
+                        type=int, required=False, default=0)
+    parser.add_argument("-d", "--exclude-duplicates", help="exclude duplicate reads", 
+                        action="store_true", default=True)
     parser.add_argument("hapcut", help="hapcut file", default=None,
                         type=argparse.FileType('r'))
     parser.add_argument("bam", help="BAM file of aligned reads", default=None,
                         type=str)
     parser.add_argument("region", help="optional region", default=None,
                         type=str, nargs="?")
-    parser_output.set_defaults(func=output_main)
-    parser_assemble.set_defaults(func=assemble_main)
-    
     args = parser.parse_args()
-    args.func(args)
+    output_main(args)
