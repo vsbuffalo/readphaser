@@ -43,6 +43,9 @@ def filter_fun_factory(mapq, exclude_duplicates, exclude_indels):
     Make a closure around some filtering options. This returns a tuple
     of a counter, and the filtering closure. Side-effects of the
     counter occur while filter occurs.
+
+    The stats key "filtered" is updated, which allows total counts to kept. Otherwise, reads being
+    filtered for more than one reason may be double counted.
     """
     stats = Counter()
     def read_passes_fun(read):
