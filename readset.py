@@ -94,8 +94,7 @@ class ReadSet(object):
             for i, read in enumerate(readpair):
                 if read is None:
                     continue
-                which = i + 1
-                header = "%s-%s %s" % (qname, which, self.keyvals)
+                header = "%s/%i %s" % (qname, i + 1, self.keyvals)
                 entry = "@%s\n%s\n+\n%s" % (header, read.seq, read.qual)
                 out.append(entry)
         return "\n".join(out) + "\n"
@@ -108,8 +107,7 @@ class ReadSet(object):
             for i, read in enumerate(readpair):
                 if read is None:
                     continue
-                which = i + 1
-                header = "%s-%s %s" % (qname, which, self.keyvals)
+                header = "%s/%i %s" % (qname, i + 1, self.keyvals)
                 file_handle.write("@%s\n%s\n+\n%s\n" % (header, read.seq, read.qual))
 
     def __iter__(self):
