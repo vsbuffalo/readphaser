@@ -26,7 +26,7 @@ from operator import itemgetter
 import pysam
 from Bio.Seq import Seq
 from hapcut import HapCut
-import fermi as fm
+#import fermi as fm
 from readset import ReadSet
 
 ### Read-level Exceptions ###
