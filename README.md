@@ -22,9 +22,17 @@ corresponding BAM file of alignments to produce:
 
  - FASTA file of reads from unphased contigs.
 
+## Running ReadPhaser:
+
+    $ python pr.py -u unphased.fq -p phased.fq hapcout.out aln.bam
+
 ## Requirements
 
  - pysam
+
+## Citation
+
+Please cite [Krasileva et al, 2013](http://genomebiology.com/2013/14/6/R66/abstract).
 
 ## Limitations
 

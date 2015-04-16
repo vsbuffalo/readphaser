@@ -143,7 +143,7 @@ def group_varpos_by_haplotype(readpair, haplotypes, allele_counts):
             # alleles is dict of allele:phase
             interval = key[0:2]
             allele_len = key[2]
-            if read.overlap(interval[0], interval[1]) == allele_len:
+            if read.get_overlap(interval[0], interval[1]) == allele_len:
                 read_var = read.query[interval[0]-read.pos:interval[1]-read.pos]
                 htype = alleles.get(read_var, None)
                 allele_counts[interval[0]][read_var] += 1
